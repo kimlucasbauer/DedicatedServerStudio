@@ -1,0 +1,46 @@
+DEDICATED SERVER STUDIO PROPRIETARY USE LICENSE
+Version 1.0 — October 13, 2026
+
+Copyright (c) 2026 kimlucasbauer. All rights reserved.
+
+This License applies only to the original Dedicated Server Studio (DSS) software
+and materials owned by the copyright holder. Third-party software and assets
+remain subject to their respective licenses.
+
+1. Limited permission to use
+
+The copyright holder grants you a limited, non-exclusive, non-transferable,
+revocable permission to download, install, and run an unmodified official DSS
+release for your personal or internal business use. You may make copies only as
+technically necessary to install and run that official release and to keep one
+backup copy for your own archival purposes.
+
+2. Restrictions
+
+Except where applicable law expressly requires otherwise, you may not modify,
+adapt, translate, patch, or create derivative works of DSS; remove or alter its
+copyright or license notices; reverse engineer, decompile, or disassemble it;
+redistribute, publish, sublicense, sell, rent, or commercially distribute it;
+or make it available as a hosted service. No permission is granted to publish
+modified versions or to distribute source-code copies.
+
+3. Rights reserved
+
+All rights not expressly granted in this License are reserved by the copyright
+holder. This License does not grant any rights to the DSS name, logos, or other
+trademarks. Access to a public GitHub repository remains subject to GitHub's
+Terms of Service, including its repository-viewing and forking functionality;
+that platform permission does not grant additional rights under this License.
+
+4. Termination
+
+The permission to use DSS ends automatically if you materially violate this
+License. Upon termination, you must stop using DSS and delete copies in your
+possession, except where retention is required by law.
+
+5. Disclaimer
+
+DSS is provided "AS IS", without warranties or conditions of any kind, to the
+maximum extent permitted by applicable law. The copyright holder is not liable
+for damages arising from use of DSS, except where such exclusion is prohibited
+by law.
