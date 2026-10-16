@@ -272,6 +272,12 @@ function AppShell() {
     setAppUpdateOpen(true);
     const deadline = Date.now() + 45 * 60 * 1000;
     const wait = milliseconds => new Promise(resolve => window.setTimeout(resolve, milliseconds));
+    const showRestartProgress = () => setAppUpdateProgress(current => current ? ({
+      ...current,
+      phase:'restarting',
+      percent:Math.max(80, Number(current.percent) || 0),
+      message:'O DSS está reiniciando para aplicar a versão validada.'
+    }) : current);
     async function resumeUpdate() {
       while (active && Date.now() < deadline) {
         await wait(1200);
@@ -288,7 +294,7 @@ function AppShell() {
             setAppUpdateBusy(false);
             return;
           }
-        } catch { /* O painel fica indisponível enquanto o processo é trocado. */ }
+        } catch { showRestartProgress(); /* O painel fica indisponível enquanto o processo é trocado. */ }
         try {
           const response = await fetch('/api/health', { cache:'no-store' });
           if (response.ok) {
@@ -344,6 +350,12 @@ function AppShell() {
   async function installDssUpdate() {
     if (!appUpdate?.updateAvailable || !appUpdate.packageAvailable) return;
     setAppUpdateBusy(true); setAppUpdateError('');
+    const showRestartProgress = () => setAppUpdateProgress(current => current ? ({
+      ...current,
+      phase:'restarting',
+      percent:Math.max(80, Number(current.percent) || 0),
+      message:'O DSS está reiniciando para aplicar a versão validada.'
+    }) : current);
     try {
       const accepted = await api('/api/app/update/install', { method:'POST', body:'{}' });
       const operationId = accepted.operationId;
@@ -364,7 +376,7 @@ function AppShell() {
             sessionStorage.removeItem('dss-update-target');
             return;
           }
-        } catch { /* O endpoint fica indisponível enquanto o painel está reiniciando. */ }
+        } catch { showRestartProgress(); /* O endpoint fica indisponível enquanto o painel está reiniciando. */ }
         try {
           const response = await fetch('/api/health', { cache:'no-store' });
           if (!response.ok) continue;
@@ -443,8 +455,9 @@ function AppShell() {
 const DSS_UPDATE_STEPS = [
   ['checking', 'Validando a atualização'], ['downloading', 'Baixando o pacote'], ['verifying', 'Verificando o pacote'],
   ['extracting', 'Extraindo o pacote'], ['validating', 'Validando os arquivos'], ['staging', 'Preparando a nova versão'],
-  ['backing-up', 'Salvando a versão atual'], ['waiting-for-shutdown', 'Arquivos prontos; reiniciando o DSS'],
-  ['stopping-host', 'Encerrando o host antigo'], ['installing', 'Instalando os arquivos preparados'], ['restarting', 'Reiniciando o DSS no PowerShell'],
+  ['backing-up', 'Salvando a versão atual'], ['preflight', 'Validando a inicialização da nova versão'],
+  ['waiting-for-shutdown', 'Nova versão validada; aguardando a parada do DSS'], ['stopping-host', 'Encerrando o host antigo'],
+  ['stopping-launcher', 'Liberando o inicializador antigo'], ['installing', 'Instalando os arquivos preparados'], ['restarting', 'Reiniciando o DSS no PowerShell'],
   ['health-check', 'Confirmando que o DSS iniciou'], ['completed', 'Atualização concluída']
 ];
 

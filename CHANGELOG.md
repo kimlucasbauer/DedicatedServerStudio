@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.3 — 2026-10-16
+
+### Added
+
+- Add `DSS-ForceStop.cmd` to identify and force-stop a verified DSS process listening on port 5089.
+
+### Fixed
+
+- Verify the staged DSS build on an isolated loopback port before shutting down the active dashboard.
+- Wait for the previous PowerShell launcher to release its startup lock before starting the replacement, and keep the update dialog on a restart status while DSS is unavailable.
+
 ## 0.4.2 — 2026-10-16
 
 ### Adjusted

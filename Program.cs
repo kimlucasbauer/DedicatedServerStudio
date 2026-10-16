@@ -413,6 +413,9 @@ app.MapPost("/api/app/update/install", async (HttpContext context, CancellationT
                         }
                     });
                 updateProgress.Report(operationId, "verifying", 46, "Pacote baixado e verificado", release.PackageSize, release.PackageSize);
+                var currentLauncherProcessId = int.TryParse(Environment.GetEnvironmentVariable("DSS_LAUNCHER_PID"), out var launcherPid) && launcherPid > 0
+                    ? launcherPid
+                    : 0;
                 var powerShellPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe");
                 if (!File.Exists(powerShellPath)) throw new FileNotFoundException("Windows PowerShell não foi encontrado.", powerShellPath);
                 var startInfo = new ProcessStartInfo
@@ -428,6 +431,7 @@ app.MapPost("/api/app/update/install", async (HttpContext context, CancellationT
                     "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helperPath,
                     "-ProjectRoot", projectRoot, "-ArchivePath", capturedArchivePath, "-ExpectedVersion", release.LatestVersion,
                     "-ExpectedSha256", sha256, "-CurrentProcessId", Environment.ProcessId.ToString(), "-Port", listenPort.ToString(),
+                    "-CurrentLauncherProcessId", currentLauncherProcessId.ToString(),
                     "-ProgressPath", progressPath, "-OperationId", operationId.ToString("D")
                 }) startInfo.ArgumentList.Add(argument);
                 using var updater = Process.Start(startInfo) ?? throw new InvalidOperationException("Não foi possível iniciar o processo de atualização.");

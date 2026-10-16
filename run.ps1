@@ -354,6 +354,8 @@ try {
     Write-LaunchMessage "Starting DSS at $listenUrl"
     Write-LaunchMessage "Active build: $AssemblyPath"
     Write-LaunchMessage "Startup log: $launchLog"
+    $previousLauncherProcessId = $env:DSS_LAUNCHER_PID
+    $env:DSS_LAUNCHER_PID = [string]$PID
     Push-Location $projectRoot
     try {
         # Log native CLR errors even when the application cannot load its own logger.
@@ -362,7 +364,11 @@ try {
         $exitCode = $LASTEXITCODE
         $ErrorActionPreference = 'Stop'
     }
-    finally { Pop-Location }
+    finally {
+        Pop-Location
+        if ($null -eq $previousLauncherProcessId) { Remove-Item Env:DSS_LAUNCHER_PID -ErrorAction SilentlyContinue }
+        else { $env:DSS_LAUNCHER_PID = $previousLauncherProcessId }
+    }
     if ($exitCode -ne 0 -and (Test-Path -LiteralPath $restartHandoffMarker -PathType Leaf)) {
         try {
             $handoff = Get-Content -LiteralPath $restartHandoffMarker -Raw | ConvertFrom-Json

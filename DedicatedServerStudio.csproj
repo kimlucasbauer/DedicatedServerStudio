@@ -7,7 +7,7 @@
     <AssemblyName>DedicatedServerStudio</AssemblyName>
     <RootNamespace>DedicatedServerStudio</RootNamespace>
     <Product>Dedicated Server Studio</Product>
-    <Version>0.4.2</Version>
+    <Version>0.4.3</Version>
   </PropertyGroup>
 
   <ItemGroup>

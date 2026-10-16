@@ -55,5 +55,9 @@ try {
         ($runtimeManifest | ConvertTo-Json -Depth 3),
         [Text.UTF8Encoding]::new($false)
     )
+
+    foreach ($file in @('apply-update.ps1', 'CHANGELOG.md', 'DSS.cmd', 'DSS-ForceStop.cmd', 'LICENSE', 'README.md', 'run.ps1')) {
+        Copy-Item -LiteralPath (Join-Path $projectRoot $file) -Destination (Join-Path $webOutput $file) -Force
+    }
 }
 finally { Pop-Location }

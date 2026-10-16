@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$ExpectedVersion,
     [Parameter(Mandatory)][string]$ExpectedSha256,
     [Parameter(Mandatory)][int]$CurrentProcessId,
+    [int]$CurrentLauncherProcessId = 0,
     [Parameter(Mandatory)][ValidateRange(1, 65535)][int]$Port,
     [Parameter(Mandatory)][string]$ProgressPath,
     [Parameter(Mandatory)][Guid]$OperationId
@@ -27,7 +28,7 @@ $buildDirectory = $null
 $archiveHandle = $null
 $allowedFiles = @(
     'appsettings.json', 'DedicatedServerStudio.staticwebassets.endpoints.json',
-    'dss-runtime.json', 'DSS.cmd', 'run.ps1', 'apply-update.ps1', 'README.md', 'LICENSE', 'web.config'
+    'dss-runtime.json', 'DSS.cmd', 'DSS-ForceStop.cmd', 'run.ps1', 'apply-update.ps1', 'README.md', 'LICENSE', 'web.config'
 )
 
 function Write-UpdateLog([string]$Message) {
@@ -100,6 +101,126 @@ function Test-DssProcessIdentity([int]$ProcessId) {
             ($command -match 'DedicatedServerStudio(?:\.dll|\.exe)')
         return $belongsToDss -and $isDssHost
     } catch { return $false }
+}
+
+function Test-DssLauncherIdentity([int]$ProcessId) {
+    if ($ProcessId -le 0 -or $ProcessId -eq $PID) { return $false }
+    try {
+        $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        if ($null -eq $processInfo -or $processInfo.Name -notin @('powershell.exe', 'pwsh.exe')) { return $false }
+        $command = [string]$processInfo.CommandLine
+        $expectedScript = [IO.Path]::GetFullPath((Join-Path $root 'run.ps1'))
+        return $command -and $command.IndexOf($expectedScript, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+            $command -match '(?i)(?:^|\s)-File(?:\s|$)'
+    } catch { return $false }
+}
+
+function Wait-ForStoppedDssLauncher {
+    if ($CurrentLauncherProcessId -le 0 -or $CurrentLauncherProcessId -eq $PID) { return }
+    if (-not (Test-DssLauncherIdentity $CurrentLauncherProcessId)) {
+        Write-UpdateLog "The original DSS launcher $CurrentLauncherProcessId has already exited or no longer matches run.ps1."
+        return
+    }
+
+    $deadline = (Get-Date).AddSeconds(8)
+    while ((Get-Date) -lt $deadline -and (Test-DssLauncherIdentity $CurrentLauncherProcessId)) {
+        Start-Sleep -Milliseconds 150
+    }
+    if (-not (Test-DssLauncherIdentity $CurrentLauncherProcessId)) { return }
+
+    # The host and its listener are already confirmed stopped. A verified run.ps1 wrapper
+    # that remains alive can only keep the launch mutex locked and block the replacement.
+    $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($listener) { throw "Port $Port became active again before the old launcher released its lock." }
+    Write-UpdateLog "The stopped DSS host's verified launcher $CurrentLauncherProcessId still holds the startup lock; closing the wrapper before restart."
+    Write-UpdateProgress 'stopping-launcher' 84 'Liberando o inicializador anterior'
+    Stop-Process -Id $CurrentLauncherProcessId -Force -ErrorAction Stop
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $deadline -and (Test-DssLauncherIdentity $CurrentLauncherProcessId)) {
+        Start-Sleep -Milliseconds 150
+    }
+    if (Test-DssLauncherIdentity $CurrentLauncherProcessId) {
+        throw 'The previous DSS launcher did not release its startup lock.'
+    }
+}
+
+function Test-StagedDssBuild {
+    $assemblyPath = Join-Path $buildDirectory 'DedicatedServerStudio.dll'
+    $privateDataPath = Join-Path $work 'preflight-data'
+    $standardOutputPath = Join-Path $work 'preflight.stdout.log'
+    $standardErrorPath = Join-Path $work 'preflight.stderr.log'
+    $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $listenerStarted = $false
+    $preflight = $null
+    $previousDssUrl = $env:DSS_URL
+    $previousDataDirectory = $env:DSS_DATA_DIR
+    $previousDisableScan = $env:DSS_DISABLE_UPDATE_SCAN
+    try {
+        $listener.Start()
+        $listenerStarted = $true
+        $preflightPort = [int]$listener.LocalEndpoint.Port
+        $listener.Stop()
+        $listenerStarted = $false
+        $env:DSS_URL = "http://127.0.0.1:$preflightPort"
+        $env:DSS_DATA_DIR = $privateDataPath
+        $env:DSS_DISABLE_UPDATE_SCAN = '1'
+        $dotnetPath = (Get-Command dotnet.exe -ErrorAction Stop).Source
+        $preflight = Start-Process -FilePath $dotnetPath `
+            -ArgumentList @(('"' + $assemblyPath + '"'), '--no-browser') `
+            -WorkingDirectory $installStage -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $standardOutputPath -RedirectStandardError $standardErrorPath
+    }
+    finally {
+        if ($listenerStarted) { $listener.Stop() }
+        if ($null -eq $previousDssUrl) { Remove-Item Env:DSS_URL -ErrorAction SilentlyContinue } else { $env:DSS_URL = $previousDssUrl }
+        if ($null -eq $previousDataDirectory) { Remove-Item Env:DSS_DATA_DIR -ErrorAction SilentlyContinue } else { $env:DSS_DATA_DIR = $previousDataDirectory }
+        if ($null -eq $previousDisableScan) { Remove-Item Env:DSS_DISABLE_UPDATE_SCAN -ErrorAction SilentlyContinue } else { $env:DSS_DISABLE_UPDATE_SCAN = $previousDisableScan }
+    }
+
+    try {
+        $healthUrl = "http://127.0.0.1:$preflightPort/api/health"
+        $pageUrl = "http://127.0.0.1:$preflightPort/"
+        $deadline = (Get-Date).AddSeconds(60)
+        $healthy = $false
+        $lastPreflightError = ''
+        while ((Get-Date) -lt $deadline) {
+            $preflight.Refresh()
+            if ($preflight.HasExited) { break }
+            try {
+                $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 2 -ErrorAction Stop
+                if ([string]$health.version -eq $ExpectedVersion) {
+                    $page = Invoke-WebRequest -Uri $pageUrl -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
+                    if ([int]$page.StatusCode -ne 200 -or [string]::IsNullOrWhiteSpace([string]$page.Content)) {
+                        throw 'The staged dashboard did not serve its new interface.'
+                    }
+                    $healthy = $true
+                    break
+                }
+            } catch { $lastPreflightError = $_.Exception.Message }
+            Start-Sleep -Milliseconds 300
+        }
+
+        if (-not $healthy) {
+            $output = @()
+            foreach ($path in @($standardOutputPath, $standardErrorPath)) {
+                if (Test-Path -LiteralPath $path -PathType Leaf) { $output += @(Get-Content -LiteralPath $path -Tail 20) }
+            }
+            if ($lastPreflightError) { $output += $lastPreflightError }
+            $detail = if ($output.Count) { ' ' + ($output -join ' ') } else { '' }
+            throw "The staged DSS v$ExpectedVersion did not pass its loopback startup check.$detail"
+        }
+        Write-UpdateLog "The staged v$ExpectedVersion passed its isolated health and web-page checks on port $preflightPort."
+    }
+    finally {
+        if ($preflight) {
+            $preflight.Refresh()
+            if (-not $preflight.HasExited) {
+                Stop-Process -Id $preflight.Id -Force -ErrorAction SilentlyContinue
+                $null = $preflight.WaitForExit(5000)
+            }
+            $preflight.Dispose()
+        }
+    }
 }
 
 function Start-DssAgain {
@@ -181,7 +302,7 @@ try {
     $archiveHandle.Dispose(); $archiveHandle = $null
     Write-UpdateProgress 'extracting' 57 'Pacote extraído'
 
-    foreach ($required in @('DedicatedServerStudio.dll', 'DedicatedServerStudio.deps.json', 'DedicatedServerStudio.runtimeconfig.json', 'dss-runtime.json', 'run.ps1', 'DSS.cmd', 'apply-update.ps1', 'wwwroot\index.html')) {
+    foreach ($required in @('DedicatedServerStudio.dll', 'DedicatedServerStudio.deps.json', 'DedicatedServerStudio.runtimeconfig.json', 'dss-runtime.json', 'run.ps1', 'DSS.cmd', 'DSS-ForceStop.cmd', 'apply-update.ps1', 'wwwroot\index.html')) {
         if (-not (Test-Path -LiteralPath (Join-Path $extract $required) -PathType Leaf)) { throw "The update archive is missing required file $required." }
     }
     Write-UpdateProgress 'validating' 58 'Validando a versão e os arquivos extraídos'
@@ -231,8 +352,10 @@ try {
     foreach ($name in $existingFiles) { Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $backup $name) -Force }
     $backupReady = $true
 
-    Write-UpdateLog "All v$ExpectedVersion package files are extracted, verified, staged, and backed up. Waiting for the DSS host to stop."
-    Write-UpdateProgress 'waiting-for-shutdown' 78 'Todos os arquivos estão prontos. O DSS está sendo reiniciado agora.'
+    Write-UpdateProgress 'preflight' 78 'Validando a inicialização da nova versão em uma porta local isolada'
+    Test-StagedDssBuild
+    Write-UpdateLog "All v$ExpectedVersion files are extracted, validated, backed up, and the staged build passed its isolated startup check. Waiting for the current DSS host to stop for the final replacement."
+    Write-UpdateProgress 'waiting-for-shutdown' 80 'Nova versão validada; aguardando a parada do DSS atual'
     $deadline = (Get-Date).AddMinutes(3)
     $forceStopAfter = (Get-Date).AddSeconds(20)
     $forceStopAttempted = $false
@@ -255,6 +378,8 @@ try {
         if ((Get-Date) -ge $deadline) { throw 'O DSS não encerrou dentro do prazo. Nenhum arquivo da instalação foi substituído.' }
         Start-Sleep -Milliseconds 400
     } while ($true)
+
+    Wait-ForStoppedDssLauncher
 
     Write-UpdateProgress 'installing' 86 'Aplicando os arquivos que já foram preparados'
     $installationStarted = $true
@@ -311,10 +436,10 @@ catch {
         }
         catch { Write-UpdateLog "Automatic file recovery failed: $($_.Exception.Message)" }
     }
-    if (-not $backupReady -and (Test-Path -LiteralPath $work)) {
+    if (-not $installationStarted -and (Test-Path -LiteralPath $work)) {
         try { Remove-Item -LiteralPath $work -Recurse -Force } catch {}
     }
-    if (-not $backupReady -and $buildDirectory -and (Test-Path -LiteralPath $buildDirectory)) {
+    if (-not $installationStarted -and $buildDirectory -and (Test-Path -LiteralPath $buildDirectory)) {
         try { Remove-Item -LiteralPath $buildDirectory -Recurse -Force } catch {}
     }
     if (Test-Path -LiteralPath $archive) { try { Remove-Item -LiteralPath $archive -Force } catch {} }
