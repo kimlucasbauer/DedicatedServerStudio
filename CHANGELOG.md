@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.2 — 2026-10-16
+
+### Adjusted
+
+- Prepare, validate, and back up every new application file before shutting down DSS; show live progress and an explicit restart status throughout the update.
+- Restart the updated application through a visible PowerShell window and recover safely when an older launcher leaves the DSS startup lock behind.
+
 ## 0.4.1 — 2026-10-16
 
 ### Added

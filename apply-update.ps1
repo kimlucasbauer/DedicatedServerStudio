@@ -14,12 +14,16 @@ $root = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd([IO.Path]::DirectorySeparat
 $archive = [IO.Path]::GetFullPath($ArchivePath)
 $work = Join-Path $root ('.dss-update-work-' + [Guid]::NewGuid().ToString('N'))
 $extract = Join-Path $work 'package'
+$installStage = Join-Path $work 'install'
 $backup = Join-Path $work 'backup'
 $logs = Join-Path $root 'logs'
 $logPath = Join-Path $logs ('dss-update-' + (Get-Date -Format 'yyyy-MM-dd_HHmmss') + '.log')
 $backupManifest = Join-Path $backup 'manifest.json'
 $backupReady = $false
+$hostStopped = $false
+$installationStarted = $false
 $restartStarted = $false
+$buildDirectory = $null
 $archiveHandle = $null
 $allowedFiles = @(
     'appsettings.json', 'DedicatedServerStudio.staticwebassets.endpoints.json',
@@ -51,6 +55,38 @@ function Write-UpdateProgress([string]$Phase, [int]$Percent, [string]$Message, [
     } catch {}
 }
 
+function Copy-DssDirectoryWithProgress([string]$Source, [string]$Destination, [string]$Phase, [int]$StartPercent, [int]$EndPercent, [string]$Action) {
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+    $sourceRoot = [IO.Path]::GetFullPath($Source).TrimEnd('\') + '\'
+    $files = @(Get-ChildItem -LiteralPath $Source -File -Recurse -Force)
+    [long]$totalBytes = ($files | Measure-Object -Property Length -Sum).Sum
+    [long]$copiedBytes = 0
+    $lastReportTick = [Environment]::TickCount64
+    $buffer = New-Object byte[] (1024 * 1024)
+    foreach ($file in $files) {
+        $relativePath = $file.FullName.Substring($sourceRoot.Length)
+        $destinationPath = Join-Path $Destination $relativePath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destinationPath) -Force | Out-Null
+        $inputStream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+        $outputStream = [IO.File]::Open($destinationPath, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            while (($read = $inputStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $outputStream.Write($buffer, 0, $read)
+                $copiedBytes += $read
+                $now = [Environment]::TickCount64
+                if ($now - $lastReportTick -ge 500 -or $copiedBytes -eq $totalBytes) {
+                    $fraction = if ($totalBytes -gt 0) { $copiedBytes / [double]$totalBytes } else { 1 }
+                    $percent = $StartPercent + [int][Math]::Floor(($EndPercent - $StartPercent) * $fraction)
+                    Write-UpdateProgress $Phase $percent ("$Action · {0} / {1}" -f ([Math]::Min($copiedBytes, $totalBytes)), $totalBytes)
+                    $lastReportTick = $now
+                }
+            }
+        }
+        finally { $outputStream.Dispose(); $inputStream.Dispose() }
+    }
+    Write-UpdateProgress $Phase $EndPercent ("$Action · {0} / {1}" -f $totalBytes, $totalBytes)
+}
+
 function Test-DssProcessIdentity([int]$ProcessId) {
     try {
         $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
@@ -69,8 +105,8 @@ function Test-DssProcessIdentity([int]$ProcessId) {
 function Start-DssAgain {
     $powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $scriptPath = Join-Path $root 'run.ps1'
-    $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $scriptPath + '" -WaitForExistingInstance -PreviousProcessId ' + $CurrentProcessId
-    Start-Process -FilePath $powerShellPath -ArgumentList $arguments -WorkingDirectory $root -WindowStyle Hidden | Out-Null
+    $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $scriptPath + '" -WaitForExistingInstance -PreviousProcessId ' + $CurrentProcessId + ' -PauseOnFailure'
+    Start-Process -FilePath $powerShellPath -ArgumentList $arguments -WorkingDirectory $root -WindowStyle Normal | Out-Null
 }
 
 function Restore-PreviousBuild {
@@ -96,7 +132,6 @@ function Restore-PreviousBuild {
 try {
     New-Item -ItemType Directory -Path $logs -Force | Out-Null
     New-Item -ItemType Directory -Path $extract -Force | Out-Null
-    New-Item -ItemType Directory -Path $backup -Force | Out-Null
     Write-UpdateLog "Preparing DSS update to v$ExpectedVersion."
     Write-UpdateProgress 'verifying' 47 'Verificando os arquivos do pacote'
 
@@ -105,31 +140,15 @@ try {
         throw 'The downloaded package SHA-256 does not match the verified value.'
     }
 
-    Write-UpdateProgress 'waiting-for-shutdown' 50 'Aguardando o painel encerrar'
-    $deadline = (Get-Date).AddMinutes(3)
-    $forceStopAttempted = $false
-    do {
-        $processAlive = Get-Process -Id $CurrentProcessId -ErrorAction SilentlyContinue
-        $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-        if (-not $processAlive -and -not $listener) { break }
-        if (-not $forceStopAttempted -and (Get-Date) -ge $deadline.AddMinutes(-2.5) -and
-            $processAlive -and -not $listener -and (Test-DssProcessIdentity $CurrentProcessId)) {
-            Write-UpdateLog "The previous DSS host remained alive without its listener; stopping verified process $CurrentProcessId."
-            Write-UpdateProgress 'stopping-host' 52 'Encerrando o host antigo do DSS'
-            Stop-Process -Id $CurrentProcessId -Force -ErrorAction Stop
-            $forceStopAttempted = $true
-            Start-Sleep -Milliseconds 500
-            continue
-        }
-        if ((Get-Date) -ge $deadline) { throw 'O processo do DSS não encerrou dentro do prazo; os arquivos permaneceram intactos.' }
-        Start-Sleep -Milliseconds 400
-    } while ($true)
-
-    Write-UpdateProgress 'extracting' 56 'Extraindo e validando o pacote'
+    Write-UpdateProgress 'extracting' 50 'Extraindo o pacote sem interromper o DSS'
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archiveHandle = [System.IO.Compression.ZipFile]::OpenRead($archive)
     $extractRoot = [IO.Path]::GetFullPath($extract).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    [long]$totalArchiveBytes = ($archiveHandle.Entries | Measure-Object -Property Length -Sum).Sum
+    if ($totalArchiveBytes -gt 2GB) { throw 'The update archive expands beyond the 2 GB safety limit.' }
     [long]$uncompressedBytes = 0
+    [long]$extractedBytes = 0
+    $lastExtractReportTick = [Environment]::TickCount64
     foreach ($entry in $archiveHandle.Entries) {
         $relative = $entry.FullName.Replace('\', '/')
         if ([string]::IsNullOrWhiteSpace($relative) -or $relative.StartsWith('/') -or $relative -match '^[A-Za-z]:' -or
@@ -137,7 +156,6 @@ try {
             throw 'The update archive contains an unsafe path.'
         }
         $uncompressedBytes += $entry.Length
-        if ($uncompressedBytes -gt 2GB) { throw 'The update archive expands beyond the 2 GB safety limit.' }
         $destination = [IO.Path]::GetFullPath((Join-Path $extract ($relative.Replace('/', [IO.Path]::DirectorySeparatorChar))))
         if (-not $destination.StartsWith($extractRoot, [StringComparison]::OrdinalIgnoreCase)) { throw 'The update archive contains a path outside its staging folder.' }
         if ($relative.EndsWith('/')) { New-Item -ItemType Directory -Path $destination -Force | Out-Null; continue }
@@ -145,19 +163,32 @@ try {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
         $entryStream = $entry.Open()
         $fileStream = [IO.File]::Open($destination, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $entryStream.CopyTo($fileStream) } finally { $fileStream.Dispose(); $entryStream.Dispose() }
+        $buffer = New-Object byte[] (1024 * 1024)
+        try {
+            while (($read = $entryStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                $fileStream.Write($buffer, 0, $read)
+                $extractedBytes += $read
+                $now = [Environment]::TickCount64
+                if ($now - $lastExtractReportTick -ge 500 -or $extractedBytes -eq $totalArchiveBytes) {
+                    $fraction = if ($totalArchiveBytes -gt 0) { $extractedBytes / [double]$totalArchiveBytes } else { 1 }
+                    $percent = 50 + [int][Math]::Floor(7 * $fraction)
+                    Write-UpdateProgress 'extracting' $percent ("Extraindo pacote · {0} / {1}" -f $extractedBytes, $totalArchiveBytes)
+                    $lastExtractReportTick = $now
+                }
+            }
+        } finally { $fileStream.Dispose(); $entryStream.Dispose() }
     }
     $archiveHandle.Dispose(); $archiveHandle = $null
+    Write-UpdateProgress 'extracting' 57 'Pacote extraído'
 
     foreach ($required in @('DedicatedServerStudio.dll', 'DedicatedServerStudio.deps.json', 'DedicatedServerStudio.runtimeconfig.json', 'dss-runtime.json', 'run.ps1', 'DSS.cmd', 'apply-update.ps1', 'wwwroot\index.html')) {
         if (-not (Test-Path -LiteralPath (Join-Path $extract $required) -PathType Leaf)) { throw "The update archive is missing required file $required." }
     }
+    Write-UpdateProgress 'validating' 58 'Validando a versão e os arquivos extraídos'
     $runtime = Get-Content -LiteralPath (Join-Path $extract 'dss-runtime.json') -Raw | ConvertFrom-Json
     if ($runtime.assemblyPath -ne 'DedicatedServerStudio.dll') { throw 'The release runtime manifest does not point to the production assembly.' }
     $assemblyHash = (Get-FileHash -LiteralPath (Join-Path $extract 'DedicatedServerStudio.dll') -Algorithm SHA256).Hash
     if (-not $assemblyHash.Equals([string]$runtime.sha256, [StringComparison]::OrdinalIgnoreCase)) { throw 'The release assembly does not match its runtime manifest.' }
-    Write-UpdateProgress 'backing-up' 68 'Salvando uma cópia da versão atual'
-
     # Keep every build immutable so a detached console bridge can continue loading the
     # exact assembly and dependency files it started with while the panel is replaced.
     $safeVersion = $ExpectedVersion -replace '[^0-9A-Za-z.-]', '_'
@@ -175,33 +206,77 @@ try {
     $runtimeManifestPath = Join-Path $work 'dss-runtime.json'
     [IO.File]::WriteAllText($runtimeManifestPath, ($newRuntimeManifest | ConvertTo-Json -Depth 3), [Text.UTF8Encoding]::new($false))
 
+    # Prepare every replacement file on the same volume as the install. No live DSS file
+    # is touched until extraction, manifest verification, staging, and backup all finish.
+    Write-UpdateProgress 'staging' 61 'Copiando os novos arquivos para a área de preparação'
+    New-Item -ItemType Directory -Path $installStage -Force | Out-Null
+    foreach ($name in $allowedFiles) {
+        if ($name -eq 'dss-runtime.json') { continue }
+        $source = Join-Path $extract $name
+        if (Test-Path -LiteralPath $source -PathType Leaf) {
+            Copy-Item -LiteralPath $source -Destination (Join-Path $installStage $name) -Force
+        }
+    }
+    Copy-Item -LiteralPath $runtimeManifestPath -Destination (Join-Path $installStage 'dss-runtime.json') -Force
+    Copy-DssDirectoryWithProgress (Join-Path $extract 'wwwroot') (Join-Path $installStage 'wwwroot') 'staging' 64 68 'Preparando arquivos do painel'
+    if (-not (Test-Path -LiteralPath (Join-Path $installStage 'wwwroot\index.html') -PathType Leaf)) { throw 'The staged frontend is incomplete.' }
+
+    Write-UpdateProgress 'backing-up' 69 'Salvando a instalação atual antes da reinicialização'
+    New-Item -ItemType Directory -Path $backup -Force | Out-Null
     $existingFiles = @($allowedFiles | Where-Object { Test-Path -LiteralPath (Join-Path $root $_) -PathType Leaf })
     if (Test-Path -LiteralPath (Join-Path $root 'wwwroot') -PathType Container) {
-        Copy-Item -LiteralPath (Join-Path $root 'wwwroot') -Destination (Join-Path $backup 'wwwroot') -Recurse -Force
+        Copy-DssDirectoryWithProgress (Join-Path $root 'wwwroot') (Join-Path $backup 'wwwroot') 'backing-up' 70 76 'Salvando arquivos atuais'
     }
     @{ files = $existingFiles } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath $backupManifest -Encoding UTF8
     foreach ($name in $existingFiles) { Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $backup $name) -Force }
     $backupReady = $true
 
-    Write-UpdateProgress 'installing' 76 'Instalando os arquivos da nova versão'
+    Write-UpdateLog "All v$ExpectedVersion package files are extracted, verified, staged, and backed up. Waiting for the DSS host to stop."
+    Write-UpdateProgress 'waiting-for-shutdown' 78 'Todos os arquivos estão prontos. O DSS está sendo reiniciado agora.'
+    $deadline = (Get-Date).AddMinutes(3)
+    $forceStopAfter = (Get-Date).AddSeconds(20)
+    $forceStopAttempted = $false
+    do {
+        $processAlive = Test-DssProcessIdentity $CurrentProcessId
+        $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($listener -and [int]$listener.OwningProcess -ne $CurrentProcessId) {
+            throw "Port $Port is still owned by another process (PID $($listener.OwningProcess)); the installed files were left unchanged."
+        }
+        if (-not $processAlive -and -not $listener) { $hostStopped = $true; break }
+        if (-not $forceStopAttempted -and $processAlive -and (Get-Date) -ge $forceStopAfter -and
+            (-not $listener -or [int]$listener.OwningProcess -eq $CurrentProcessId)) {
+            Write-UpdateLog "The verified DSS host $CurrentProcessId did not exit after the shutdown request; stopping it so the staged update can continue."
+            Write-UpdateProgress 'stopping-host' 82 'Encerrando o processo antigo do DSS'
+            Stop-Process -Id $CurrentProcessId -Force -ErrorAction Stop
+            $forceStopAttempted = $true
+            Start-Sleep -Milliseconds 500
+            continue
+        }
+        if ((Get-Date) -ge $deadline) { throw 'O DSS não encerrou dentro do prazo. Nenhum arquivo da instalação foi substituído.' }
+        Start-Sleep -Milliseconds 400
+    } while ($true)
+
+    Write-UpdateProgress 'installing' 86 'Aplicando os arquivos que já foram preparados'
+    $installationStarted = $true
     foreach ($name in $allowedFiles) {
         if ($name -eq 'dss-runtime.json') { continue }
-        $source = Join-Path $extract $name
-        if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Item -LiteralPath $source -Destination (Join-Path $root $name) -Force }
+        $source = Join-Path $installStage $name
+        if (Test-Path -LiteralPath $source -PathType Leaf) { Move-Item -LiteralPath $source -Destination (Join-Path $root $name) -Force }
     }
-    Move-Item -LiteralPath $runtimeManifestPath -Destination (Join-Path $root 'dss-runtime.json') -Force
     $oldWebRoot = Join-Path $root 'wwwroot'
-    if (Test-Path -LiteralPath $oldWebRoot) { Remove-Item -LiteralPath $oldWebRoot -Recurse -Force }
-    Copy-Item -LiteralPath (Join-Path $extract 'wwwroot') -Destination $oldWebRoot -Recurse -Force
+    $stagedOldWebRoot = Join-Path $work 'previous-wwwroot'
+    if (Test-Path -LiteralPath $oldWebRoot) { Move-Item -LiteralPath $oldWebRoot -Destination $stagedOldWebRoot -Force }
+    Move-Item -LiteralPath (Join-Path $installStage 'wwwroot') -Destination $oldWebRoot -Force
+    Move-Item -LiteralPath (Join-Path $installStage 'dss-runtime.json') -Destination (Join-Path $root 'dss-runtime.json') -Force
 
     Write-UpdateLog "Installed v$ExpectedVersion files. Starting the updated DSS process."
-    Write-UpdateProgress 'restarting' 87 'Reiniciando o painel'
+    Write-UpdateProgress 'restarting' 91 'Arquivos instalados. Reiniciando o DSS pelo PowerShell.'
     Start-DssAgain
     $restartStarted = $true
     $healthUrl = "http://127.0.0.1:$Port/api/health"
     $healthDeadline = (Get-Date).AddMinutes(3)
     $healthy = $false
-    Write-UpdateProgress 'health-check' 93 'Confirmando que a nova versão iniciou'
+    Write-UpdateProgress 'health-check' 96 'Aguardando o DSS voltar e confirmar a nova versão'
     while ((Get-Date) -lt $healthDeadline) {
         try {
             $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 2 -ErrorAction Stop
@@ -229,12 +304,18 @@ try {
 catch {
     Write-UpdateLog "Update failed: $($_.Exception.Message)"
     Write-UpdateProgress 'failed' 100 'A atualização falhou' $_.Exception.Message
-    if (-not $restartStarted -and $backupReady) {
-        try { Restore-PreviousBuild; Write-UpdateLog 'Restored the previous application files after an update error.'; Start-DssAgain }
+    if ($backupReady -and ($hostStopped -or $installationStarted -or $restartStarted)) {
+        try {
+            if ($installationStarted) { Restore-PreviousBuild; Write-UpdateLog 'Restored the previous application files after an update error.' }
+            if (-not $restartStarted) { Start-DssAgain }
+        }
         catch { Write-UpdateLog "Automatic file recovery failed: $($_.Exception.Message)" }
     }
     if (-not $backupReady -and (Test-Path -LiteralPath $work)) {
         try { Remove-Item -LiteralPath $work -Recurse -Force } catch {}
+    }
+    if (-not $backupReady -and $buildDirectory -and (Test-Path -LiteralPath $buildDirectory)) {
+        try { Remove-Item -LiteralPath $buildDirectory -Recurse -Force } catch {}
     }
     if (Test-Path -LiteralPath $archive) { try { Remove-Item -LiteralPath $archive -Force } catch {} }
     exit 1

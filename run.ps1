@@ -51,6 +51,30 @@ function Test-DssProcessIdentity([int]$ProcessId) {
     } catch { return $false }
 }
 
+function Stop-StaleDssLauncher([datetime]$OlderThan) {
+    $expectedScript = [IO.Path]::GetFullPath((Join-Path $projectRoot 'run.ps1'))
+    try {
+        $candidates = Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
+            [int]$_.ProcessId -ne $PID -and
+            $_.Name -in @('powershell.exe', 'pwsh.exe') -and
+            $_.CommandLine -and
+            $_.CommandLine.IndexOf($expectedScript, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+            $_.CommandLine -match '(?i)(?:^|\s)-File(?:\s|$)' -and
+            $_.CommandLine -notmatch '(?i)-WaitForExistingInstance'
+        }
+        foreach ($candidate in $candidates) {
+            if ($candidate.CreationDate -and [datetime]$candidate.CreationDate -ge $OlderThan) { continue }
+            $candidateId = [int]$candidate.ProcessId
+            if (-not (Get-Process -Id $candidateId -ErrorAction SilentlyContinue)) { continue }
+            Write-LaunchMessage "The DSS host and listener are closed, but the verified launcher (PID $candidateId) still holds the startup lock. Closing that stale launcher so startup can continue."
+            Stop-Process -Id $candidateId -Force -ErrorAction Stop
+            return $true
+        }
+    }
+    catch { Write-LaunchMessage "Could not inspect a stale DSS launcher: $($_.Exception.Message)" }
+    return $false
+}
+
 function Write-StartupSignal([bool]$Ready, [bool]$IsAdministrator, [string]$Message = '') {
     if ([string]::IsNullOrWhiteSpace($script:startupSignalPath)) { return }
     $signalPath = $script:startupSignalPath
@@ -166,13 +190,18 @@ try {
 
     $launchMutex = [Threading.Mutex]::new($false, "Local\DedicatedServerStudio-Launcher-$($listenUri.Port)")
     if ($WaitForExistingInstance) {
-        $waitUntil = (Get-Date).AddSeconds(90)
-        $forceStopAfter = (Get-Date).AddSeconds(2)
+        $waitStarted = Get-Date
+        $waitUntil = $waitStarted.AddSeconds(120)
+        $forceStopAfter = $waitStarted.AddSeconds(8)
+        $nextStaleLauncherCheck = $waitStarted.AddSeconds(20)
         $forceStopAttempted = $false
         $previousProcess = $null
         if ($PreviousProcessId -gt 0) {
-            try { $previousProcess = Get-Process -Id $PreviousProcessId -ErrorAction Stop }
-            catch { $previousProcess = $null }
+            if (Test-DssProcessIdentity $PreviousProcessId) {
+                try { $previousProcess = Get-Process -Id $PreviousProcessId -ErrorAction Stop }
+                catch { $previousProcess = $null }
+            }
+            else { Write-LaunchMessage "PID $PreviousProcessId no longer identifies the previous DSS host; waiting only for the DSS listener and startup lock." }
         }
         Write-LaunchMessage 'Waiting for the current DSS instance to close before restarting with the selected permission mode.'
         do {
@@ -180,6 +209,10 @@ try {
             if ($previousProcess) {
                 try { $previousProcess.Refresh(); $previousProcessExited = $previousProcess.HasExited }
                 catch { $previousProcessExited = $true }
+                if (-not $previousProcessExited -and -not (Test-DssProcessIdentity $PreviousProcessId)) {
+                    Write-LaunchMessage "PID $PreviousProcessId no longer identifies the previous DSS host. Leaving that process untouched and continuing the handoff."
+                    $previousProcessExited = $true
+                }
             }
             if (-not $previousProcessExited) {
                 if (-not $forceStopAttempted -and $PreviousProcessId -gt 0 -and (Get-Date) -ge $forceStopAfter -and
@@ -229,10 +262,27 @@ try {
             # Avoid repeated TCP table scans while the old host is still shutting down.
             # Its process handle and the launcher mutex give us cheap, reliable wait signals.
             $listener = Get-NetTCPConnection -LocalPort $listenUri.Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $listener) {
+            if ($listener) {
+                $listenerProcessId = [int]$listener.OwningProcess
+                if (-not (Test-DssProcessIdentity $listenerProcessId)) {
+                    throw "Port $($listenUri.Port) is still owned by another application (PID $listenerProcessId). The updater left the application files unchanged until the port is free."
+                }
+                if (-not $forceStopAttempted -and (Get-Date) -ge $waitStarted.AddSeconds(20)) {
+                    Write-LaunchMessage "The previous verified DSS host (PID $listenerProcessId) is still listening during the restart handoff. Stopping that host so the update can continue."
+                    Stop-Process -Id $listenerProcessId -Force -ErrorAction Stop
+                    $forceStopAttempted = $true
+                    Start-Sleep -Milliseconds 250
+                    continue
+                }
+            }
+            else {
                 try { $ownsLaunchMutex = $launchMutex.WaitOne(150) }
                 catch [Threading.AbandonedMutexException] { $ownsLaunchMutex = $true }
                 if ($ownsLaunchMutex) { break }
+                if ((Get-Date) -ge $nextStaleLauncherCheck) {
+                    $null = Stop-StaleDssLauncher $waitStarted.AddSeconds(-15)
+                    $nextStaleLauncherCheck = (Get-Date).AddSeconds(5)
+                }
             }
             if ((Get-Date) -ge $waitUntil) { throw 'The current DSS instance did not close in time. Close the previous instance and try again.' }
             Start-Sleep -Milliseconds 100

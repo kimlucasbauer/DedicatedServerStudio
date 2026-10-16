@@ -50,7 +50,7 @@ builder.Services.AddSingleton<PlayerManagementService>();
 builder.Services.AddHttpClient("steamcmd", client =>
 {
     client.Timeout = TimeSpan.FromMinutes(10);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
 });
 builder.Services.AddSingleton<SteamCmdService>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<SteamCmdService>());
@@ -60,27 +60,27 @@ builder.Services.AddSingleton<ModPackageManager>();
 builder.Services.AddHttpClient("catalog", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(18);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
 });
 builder.Services.AddHttpClient("mod-download", client =>
 {
     client.Timeout = Timeout.InfiniteTimeSpan;
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
 });
 builder.Services.AddHttpClient("r2modman", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(45);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
 });
 builder.Services.AddHttpClient("public-ip", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(4);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
 });
 builder.Services.AddHttpClient<GitHubReleaseService>(client =>
 {
     client.Timeout = TimeSpan.FromSeconds(45);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
     client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
 });
 builder.Services.AddSingleton<R2ModmanProfileService>();
@@ -197,7 +197,7 @@ var r2modmanProfiles = app.Services.GetRequiredService<R2ModmanProfileService>()
 var githubReleases = app.Services.GetRequiredService<GitHubReleaseService>();
 
 var elevationStartupId = Guid.NewGuid().ToString("N");
-app.MapGet("/api/health", () => Results.Ok(new { status = "ready", app = "Dedicated Server Studio", shortName = "DSS", version = "0.4.1", startupId = elevationStartupId }));
+app.MapGet("/api/health", () => Results.Ok(new { status = "ready", app = "Dedicated Server Studio", shortName = "DSS", version = "0.4.2", startupId = elevationStartupId }));
 
 app.MapGet("/api/app/elevation/status", (HttpContext context) =>
 {
@@ -431,9 +431,35 @@ app.MapPost("/api/app/update/install", async (HttpContext context, CancellationT
                     "-ProgressPath", progressPath, "-OperationId", operationId.ToString("D")
                 }) startInfo.ArgumentList.Add(argument);
                 using var updater = Process.Start(startInfo) ?? throw new InvalidOperationException("Não foi possível iniciar o processo de atualização.");
-                updateProgress.Report(operationId, "waiting-for-shutdown", 49, "Preparando a reinicialização do painel");
-                await Task.Delay(1200);
-                app.Lifetime.StopApplication();
+                var preparationDeadline = DateTimeOffset.UtcNow.AddMinutes(15);
+                while (DateTimeOffset.UtcNow < preparationDeadline)
+                {
+                    var currentProgress = updateProgress.Get(operationId);
+                    if (currentProgress?.Phase == "waiting-for-shutdown")
+                    {
+                        app.Logger.LogInformation("DSS update {OperationId} is staged and validated; shutting down for installation.", operationId);
+                        app.Lifetime.StopApplication();
+                        return;
+                    }
+                    if (currentProgress?.Phase == "failed") return;
+                    if (updater.HasExited)
+                    {
+                        var exitCode = updater.ExitCode;
+                        var message = $"O atualizador encerrou antes de preparar a instalação (código {exitCode}). Consulte logs/dss-update-*.log.";
+                        app.Logger.LogError("DSS update helper exited before shutdown with code {ExitCode} for operation {OperationId}.", exitCode, operationId);
+                        updateProgress.Report(operationId, "failed", 100, "Falha ao preparar a atualização", error: message);
+                        return;
+                    }
+                    await Task.Delay(250);
+                }
+
+                try { updater.Kill(entireProcessTree: true); }
+                catch (InvalidOperationException) { }
+                var timeoutMessage = "A preparação da atualização excedeu 15 minutos. O painel permaneceu aberto e nenhum arquivo foi substituído.";
+                app.Logger.LogError("DSS update preparation timed out for operation {OperationId}.", operationId);
+                updateProgress.Report(operationId, "failed", 100, "Tempo esgotado ao preparar a atualização", error: timeoutMessage);
+                try { if (File.Exists(capturedArchivePath)) File.Delete(capturedArchivePath); }
+                catch (Exception cleanupError) { app.Logger.LogWarning(cleanupError, "Could not remove a timed-out DSS update download"); }
             }
             catch (Exception ex)
             {

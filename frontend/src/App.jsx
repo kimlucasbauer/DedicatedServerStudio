@@ -270,7 +270,7 @@ function AppShell() {
     } catch {}
     setAppUpdateBusy(true);
     setAppUpdateOpen(true);
-    const deadline = Date.now() + 8 * 60 * 1000;
+    const deadline = Date.now() + 45 * 60 * 1000;
     const wait = milliseconds => new Promise(resolve => window.setTimeout(resolve, milliseconds));
     async function resumeUpdate() {
       while (active && Date.now() < deadline) {
@@ -352,7 +352,7 @@ function AppShell() {
       sessionStorage.setItem('dss-update-startup', appStartupId || '');
       sessionStorage.setItem('dss-update-target', appUpdate.latestVersion || '');
       setAppUpdateProgress(accepted);
-      const deadline = Date.now() + 8 * 60 * 1000;
+      const deadline = Date.now() + 45 * 60 * 1000;
       while (Date.now() < deadline) {
         await new Promise(resolve => setTimeout(resolve, 1200));
         try {
@@ -442,17 +442,18 @@ function AppShell() {
 
 const DSS_UPDATE_STEPS = [
   ['checking', 'Validando a atualização'], ['downloading', 'Baixando o pacote'], ['verifying', 'Verificando o pacote'],
-  ['waiting-for-shutdown', 'Aguardando o painel encerrar'], ['stopping-host', 'Encerrando o host antigo'],
-  ['extracting', 'Extraindo e validando os arquivos'], ['backing-up', 'Salvando a versão atual'],
-  ['installing', 'Instalando a nova versão'], ['restarting', 'Reiniciando o painel'],
+  ['extracting', 'Extraindo o pacote'], ['validating', 'Validando os arquivos'], ['staging', 'Preparando a nova versão'],
+  ['backing-up', 'Salvando a versão atual'], ['waiting-for-shutdown', 'Arquivos prontos; reiniciando o DSS'],
+  ['stopping-host', 'Encerrando o host antigo'], ['installing', 'Instalando os arquivos preparados'], ['restarting', 'Reiniciando o DSS no PowerShell'],
   ['health-check', 'Confirmando que o DSS iniciou'], ['completed', 'Atualização concluída']
 ];
 
 function DssUpdateProgress({ progress, version }) {
   const currentIndex = Math.max(0, DSS_UPDATE_STEPS.findIndex(([phase]) => phase === progress?.phase));
   const percent = Math.max(0, Math.min(100, Number(progress?.percent) || 0));
+  const currentMessage = progress?.message || DSS_UPDATE_STEPS[currentIndex]?.[1] || 'Preparando a atualização';
   return <section className="dss-update-progress-panel" aria-live="polite">
-    <div className="dss-update-progress-heading"><div><b><span>Atualizando para a versão</span> {version}</b><small>{DSS_UPDATE_STEPS[currentIndex]?.[1] || 'Preparando a atualização'}</small></div><strong>{percent}%</strong></div>
+    <div className="dss-update-progress-heading"><div><b><span>Atualizando para a versão</span> {version}</b><small>{currentMessage}</small></div><strong>{percent}%</strong></div>
     <div className="dss-update-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow={percent}><i style={{width:`${percent}%`}}/></div>
     {progress?.downloadedBytes != null&&<small className="dss-update-bytes">{bytes(progress.downloadedBytes)}{progress.totalBytes!=null?` / ${bytes(progress.totalBytes)}`:''}</small>}
     <ol className="dss-update-steps">{DSS_UPDATE_STEPS.map(([phase,label],index)=>{
