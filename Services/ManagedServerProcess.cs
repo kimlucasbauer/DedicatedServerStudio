@@ -14,6 +14,7 @@ public sealed class ManagedServerProcess : IManagedServerProcess
     private const uint StartfUseStdHandles = 0x00000100;
     private const uint HandleFlagInherit = 0x00000001;
     private const uint CtrlBreakEvent = 1;
+    private const uint AttachParentProcess = 0xFFFFFFFF;
 
     private readonly StreamWriter _input;
     private readonly Process _process;
@@ -124,14 +125,16 @@ public sealed class ManagedServerProcess : IManagedServerProcess
     {
         if (process.HasExited) return true;
         var attachedConsole = false;
+        var wasAttachedToConsole = GetConsoleWindow() != IntPtr.Zero;
         var ignoreCtrlEvents = false;
         try
         {
-            if (GetConsoleWindow() == IntPtr.Zero)
-            {
-                attachedConsole = AttachConsole(unchecked((uint)process.Id));
-                if (!attachedConsole && Marshal.GetLastWin32Error() != 5) return false;
-            }
+            // After a DSS restart, the new panel can be attached to a different
+            // terminal from the server. Detach first so Ctrl+Break targets the
+            // console that owns this process instead of the new panel's console.
+            if (wasAttachedToConsole && !FreeConsole()) return false;
+            attachedConsole = AttachConsole(unchecked((uint)process.Id));
+            if (!attachedConsole) return false;
             ignoreCtrlEvents = SetConsoleCtrlHandler(IntPtr.Zero, true);
             if (!GenerateConsoleCtrlEvent(CtrlBreakEvent, unchecked((uint)process.Id))) return false;
             using var cancellation = new CancellationTokenSource(timeout);
@@ -143,6 +146,7 @@ public sealed class ManagedServerProcess : IManagedServerProcess
         {
             if (ignoreCtrlEvents) SetConsoleCtrlHandler(IntPtr.Zero, false);
             if (attachedConsole) FreeConsole();
+            if (wasAttachedToConsole) AttachConsole(AttachParentProcess);
         }
     }
 

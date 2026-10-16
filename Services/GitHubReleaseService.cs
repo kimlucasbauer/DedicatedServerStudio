@@ -70,7 +70,8 @@ public sealed class GitHubReleaseService(HttpClient client)
             assetName, assetSize, assetUrl, digest);
     }
 
-    public async Task<string> DownloadPackageAsync(DssReleaseInfo release, string destinationPath, CancellationToken cancellationToken = default)
+    public async Task<string> DownloadPackageAsync(DssReleaseInfo release, string destinationPath,
+        CancellationToken cancellationToken = default, Action<long, long?>? progress = null)
     {
         if (!release.PackageAvailable || release.PackageUrl is null ||
             !release.PackageUrl.StartsWith(AssetBaseUrl, StringComparison.OrdinalIgnoreCase))
@@ -86,6 +87,8 @@ public sealed class GitHubReleaseService(HttpClient client)
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         var buffer = new byte[128 * 1024];
         long total = 0;
+        var expectedLength = response.Content.Headers.ContentLength ?? release.PackageSize;
+        progress?.Invoke(0, expectedLength);
         while (true)
         {
             var read = await source.ReadAsync(buffer, cancellationToken);
@@ -94,6 +97,7 @@ public sealed class GitHubReleaseService(HttpClient client)
             if (total > MaximumArchiveSize) throw new InvalidDataException("O pacote de atualização excede o limite de 2 GB.");
             hash.AppendData(buffer, 0, read);
             await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+            progress?.Invoke(total, expectedLength);
         }
         await destination.FlushAsync(cancellationToken);
         var sha256 = Convert.ToHexString(hash.GetHashAndReset());

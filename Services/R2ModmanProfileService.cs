@@ -14,7 +14,7 @@ public sealed class R2ModmanProfileService(IHttpClientFactory clients)
     private const long MaxConfigBytes = 30L * 1024 * 1024;
     private const int MaxEntries = 10_000;
     private const int MaxMods = 200;
-    private const int MaxConfigFileBytes = 1_000_000;
+    private const int MaxConfigFileBytes = 10 * 1024 * 1024;
     private static readonly UTF8Encoding StrictUtf8 = new(false, true);
     private static readonly HashSet<string> ConfigExtensions = new(StringComparer.OrdinalIgnoreCase)
         { ".cfg", ".json", ".yaml", ".yml", ".toml", ".xml", ".txt" };
@@ -85,7 +85,7 @@ public sealed class R2ModmanProfileService(IHttpClientFactory clients)
                 if (!ConfigExtensions.Contains(Path.GetExtension(relativePath))) continue;
                 if (!destinations.Add(relativePath)) throw new InvalidDataException($"O arquivo contém configurações repetidas: {relativePath}.");
                 if (entry.Length > MaxConfigFileBytes)
-                    throw new InvalidDataException($"A configuração {relativePath} excede o limite de 1 MB aceito pelo DSS.");
+                    throw new InvalidDataException($"A configuração {relativePath} excede o limite de 10 MB aceito pelo DSS.");
                 configBytes += entry.Length;
                 if (configBytes > MaxConfigBytes) throw new InvalidDataException("As configurações do perfil excedem o limite total de 30 MB.");
                 using var stream = entry.Open();

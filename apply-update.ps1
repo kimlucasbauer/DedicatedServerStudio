@@ -4,7 +4,9 @@ param(
     [Parameter(Mandatory)][string]$ExpectedVersion,
     [Parameter(Mandatory)][string]$ExpectedSha256,
     [Parameter(Mandatory)][int]$CurrentProcessId,
-    [Parameter(Mandatory)][ValidateRange(1, 65535)][int]$Port
+    [Parameter(Mandatory)][ValidateRange(1, 65535)][int]$Port,
+    [Parameter(Mandatory)][string]$ProgressPath,
+    [Parameter(Mandatory)][Guid]$OperationId
 )
 
 $ErrorActionPreference = 'Stop'
@@ -29,10 +31,45 @@ function Write-UpdateLog([string]$Message) {
     try { [IO.File]::AppendAllText($logPath, $line + [Environment]::NewLine, [Text.UTF8Encoding]::new($false)) } catch {}
 }
 
+function Write-UpdateProgress([string]$Phase, [int]$Percent, [string]$Message, [string]$FailureMessage = $null) {
+    try {
+        $destination = [IO.Path]::GetFullPath($ProgressPath)
+        $temporary = $destination + '.' + [Guid]::NewGuid().ToString('N') + '.tmp'
+        $current = @{
+            operationId = $OperationId.ToString('D')
+            latestVersion = $ExpectedVersion
+            phase = $Phase
+            percent = [Math]::Max(0, [Math]::Min(100, $Percent))
+            message = $Message
+            downloadedBytes = $null
+            totalBytes = $null
+            error = $FailureMessage
+            updatedAt = [DateTimeOffset]::UtcNow.ToString('o')
+        } | ConvertTo-Json -Depth 3 -Compress
+        [IO.File]::WriteAllText($temporary, $current, [Text.UTF8Encoding]::new($false))
+        Move-Item -LiteralPath $temporary -Destination $destination -Force
+    } catch {}
+}
+
+function Test-DssProcessIdentity([int]$ProcessId) {
+    try {
+        $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        if ($null -eq $processInfo) { return $false }
+        $image = [string]$processInfo.ExecutablePath
+        $command = [string]$processInfo.CommandLine
+        $normalizedRoot = $root.TrimEnd('\') + '\'
+        $belongsToDss = ($image -and $image.StartsWith($normalizedRoot, [StringComparison]::OrdinalIgnoreCase)) -or
+            ($command -and $command.IndexOf($normalizedRoot, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+        $isDssHost = ([IO.Path]::GetFileNameWithoutExtension($image) -in @('DedicatedServerStudio', 'dotnet')) -and
+            ($command -match 'DedicatedServerStudio(?:\.dll|\.exe)')
+        return $belongsToDss -and $isDssHost
+    } catch { return $false }
+}
+
 function Start-DssAgain {
     $powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $scriptPath = Join-Path $root 'run.ps1'
-    $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $scriptPath + '" -WaitForExistingInstance'
+    $arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $scriptPath + '" -WaitForExistingInstance -PreviousProcessId ' + $CurrentProcessId
     Start-Process -FilePath $powerShellPath -ArgumentList $arguments -WorkingDirectory $root -WindowStyle Hidden | Out-Null
 }
 
@@ -61,21 +98,34 @@ try {
     New-Item -ItemType Directory -Path $extract -Force | Out-Null
     New-Item -ItemType Directory -Path $backup -Force | Out-Null
     Write-UpdateLog "Preparing DSS update to v$ExpectedVersion."
+    Write-UpdateProgress 'verifying' 47 'Verificando os arquivos do pacote'
 
     $expectedHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash
     if (-not $expectedHash.Equals($ExpectedSha256, [StringComparison]::OrdinalIgnoreCase)) {
         throw 'The downloaded package SHA-256 does not match the verified value.'
     }
 
+    Write-UpdateProgress 'waiting-for-shutdown' 50 'Aguardando o painel encerrar'
     $deadline = (Get-Date).AddMinutes(3)
+    $forceStopAttempted = $false
     do {
         $processAlive = Get-Process -Id $CurrentProcessId -ErrorAction SilentlyContinue
         $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $processAlive -and -not $listener) { break }
-        if ((Get-Date) -ge $deadline) { throw 'The running DSS process did not close in time; the files were left unchanged.' }
+        if (-not $forceStopAttempted -and (Get-Date) -ge $deadline.AddMinutes(-2.5) -and
+            $processAlive -and -not $listener -and (Test-DssProcessIdentity $CurrentProcessId)) {
+            Write-UpdateLog "The previous DSS host remained alive without its listener; stopping verified process $CurrentProcessId."
+            Write-UpdateProgress 'stopping-host' 52 'Encerrando o host antigo do DSS'
+            Stop-Process -Id $CurrentProcessId -Force -ErrorAction Stop
+            $forceStopAttempted = $true
+            Start-Sleep -Milliseconds 500
+            continue
+        }
+        if ((Get-Date) -ge $deadline) { throw 'O processo do DSS não encerrou dentro do prazo; os arquivos permaneceram intactos.' }
         Start-Sleep -Milliseconds 400
     } while ($true)
 
+    Write-UpdateProgress 'extracting' 56 'Extraindo e validando o pacote'
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     $archiveHandle = [System.IO.Compression.ZipFile]::OpenRead($archive)
     $extractRoot = [IO.Path]::GetFullPath($extract).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
@@ -106,6 +156,7 @@ try {
     if ($runtime.assemblyPath -ne 'DedicatedServerStudio.dll') { throw 'The release runtime manifest does not point to the production assembly.' }
     $assemblyHash = (Get-FileHash -LiteralPath (Join-Path $extract 'DedicatedServerStudio.dll') -Algorithm SHA256).Hash
     if (-not $assemblyHash.Equals([string]$runtime.sha256, [StringComparison]::OrdinalIgnoreCase)) { throw 'The release assembly does not match its runtime manifest.' }
+    Write-UpdateProgress 'backing-up' 68 'Salvando uma cópia da versão atual'
 
     # Keep every build immutable so a detached console bridge can continue loading the
     # exact assembly and dependency files it started with while the panel is replaced.
@@ -132,6 +183,7 @@ try {
     foreach ($name in $existingFiles) { Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $backup $name) -Force }
     $backupReady = $true
 
+    Write-UpdateProgress 'installing' 76 'Instalando os arquivos da nova versão'
     foreach ($name in $allowedFiles) {
         if ($name -eq 'dss-runtime.json') { continue }
         $source = Join-Path $extract $name
@@ -143,11 +195,13 @@ try {
     Copy-Item -LiteralPath (Join-Path $extract 'wwwroot') -Destination $oldWebRoot -Recurse -Force
 
     Write-UpdateLog "Installed v$ExpectedVersion files. Starting the updated DSS process."
+    Write-UpdateProgress 'restarting' 87 'Reiniciando o painel'
     Start-DssAgain
     $restartStarted = $true
     $healthUrl = "http://127.0.0.1:$Port/api/health"
     $healthDeadline = (Get-Date).AddMinutes(3)
     $healthy = $false
+    Write-UpdateProgress 'health-check' 93 'Confirmando que a nova versão iniciou'
     while ((Get-Date) -lt $healthDeadline) {
         try {
             $health = Invoke-RestMethod -Uri $healthUrl -TimeoutSec 2 -ErrorAction Stop
@@ -168,11 +222,13 @@ try {
     }
 
     Write-UpdateLog "DSS v$ExpectedVersion is responding. Update completed."
+    Write-UpdateProgress 'completed' 100 'DSS atualizado e pronto'
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
     if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
 }
 catch {
     Write-UpdateLog "Update failed: $($_.Exception.Message)"
+    Write-UpdateProgress 'failed' 100 'A atualização falhou' $_.Exception.Message
     if (-not $restartStarted -and $backupReady) {
         try { Restore-PreviousBuild; Write-UpdateLog 'Restored the previous application files after an update error.'; Start-DssAgain }
         catch { Write-UpdateLog "Automatic file recovery failed: $($_.Exception.Message)" }

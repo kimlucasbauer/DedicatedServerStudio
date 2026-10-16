@@ -39,6 +39,7 @@ builder.Services.AddAntiforgery(options => options.HeaderName = "X-DSS-CSRF");
 builder.Services.AddSingleton<StateStore>();
 builder.Services.AddSingleton<ProviderCredentialVault>();
 builder.Services.AddSingleton<AuthService>();
+builder.Services.AddSingleton<DssUpdateProgressStore>();
 builder.Services.AddSingleton<IGameAdapter, ValheimGameAdapter>();
 builder.Services.AddSingleton<GameAdapterRegistry>();
 builder.Services.AddSingleton<WindowsFirewallService>();
@@ -49,7 +50,7 @@ builder.Services.AddSingleton<PlayerManagementService>();
 builder.Services.AddHttpClient("steamcmd", client =>
 {
     client.Timeout = TimeSpan.FromMinutes(10);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
 });
 builder.Services.AddSingleton<SteamCmdService>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<SteamCmdService>());
@@ -59,27 +60,27 @@ builder.Services.AddSingleton<ModPackageManager>();
 builder.Services.AddHttpClient("catalog", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(18);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
 });
 builder.Services.AddHttpClient("mod-download", client =>
 {
     client.Timeout = Timeout.InfiniteTimeSpan;
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
 });
 builder.Services.AddHttpClient("r2modman", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(45);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
 });
 builder.Services.AddHttpClient("public-ip", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(4);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
 });
 builder.Services.AddHttpClient<GitHubReleaseService>(client =>
 {
     client.Timeout = TimeSpan.FromSeconds(45);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
     client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
 });
 builder.Services.AddSingleton<R2ModmanProfileService>();
@@ -95,6 +96,7 @@ if (!isFirstInstance)
 
 var state = app.Services.GetRequiredService<StateStore>();
 var auth = app.Services.GetRequiredService<AuthService>();
+var updateProgress = app.Services.GetRequiredService<DssUpdateProgressStore>();
 if (listenMode != "local" && await state.ReadAsync(data => string.IsNullOrWhiteSpace(data.AdminPasswordHash)))
     throw new InvalidOperationException("Set up the administrator password on localhost before enabling LAN or public access.");
 
@@ -114,26 +116,60 @@ app.Use(async (context, next) =>
         }
     }
     var path = context.Request.Path.Value ?? "";
+    var sessionUserId = auth.GetSessionUserId(context);
+    if (sessionUserId is { } signedInUserId && (context.Request.Method is "POST" or "PUT" or "PATCH" or "DELETE"))
+    {
+        var isStandardUser = await state.ReadAsync(data => data.Users.Any(user => user.Id == signedInUserId && user.Role == "user"));
+        var instanceSegment = path.StartsWith("/api/instances/", StringComparison.OrdinalIgnoreCase)
+            ? path["/api/instances/".Length..].Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()
+            : null;
+        var isInstanceAction = Guid.TryParse(instanceSegment, out _);
+        var isPersonalPreference = context.Request.Method == "PUT" && path.Equals("/api/settings/language", StringComparison.OrdinalIgnoreCase);
+        var isLogout = context.Request.Method == "POST" && path.Equals("/api/auth/logout", StringComparison.OrdinalIgnoreCase);
+        if (isStandardUser && !isInstanceAction && !isPersonalPreference && !isLogout)
+        {
+            context.Response.StatusCode = StatusCodes.Status403Forbidden;
+            await context.Response.WriteAsJsonAsync(new { error = "Contas User têm acesso somente de leitura e podem iniciar, parar ou reiniciar servidores dos perfis associados." });
+            return;
+        }
+    }
     if (path.StartsWith("/api/instances/", StringComparison.OrdinalIgnoreCase))
     {
         var segment = path["/api/instances/".Length..].Split('/', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault();
-        if (Guid.TryParse(segment, out var profileId) && auth.GetSessionUserId(context) is { } userId)
+        if (Guid.TryParse(segment, out var profileId) && sessionUserId is { } userId)
         {
-            var permission = await state.ReadAsync(data =>
+            var access = await state.ReadAsync(data =>
             {
-                if (data.Users.Any(user => user.Id == userId && user.Role == "admin")) return "admin";
+                var role = data.Users.FirstOrDefault(user => user.Id == userId)?.Role ?? "";
                 var profile = data.Instances.FirstOrDefault(item => item.Id == profileId);
-                if (profile is null) return null;
-                if (profile.UserAccess.TryGetValue(userId, out var configuredPermission)) return configuredPermission;
-                return profile.AllowedUserIds.Contains(userId) ? "edit" : null;
+                if (profile is null) return (Role: role, Permission: (string?)null, Associated: false);
+                var associated = profile.UserAccess.ContainsKey(userId) || profile.AllowedUserIds.Contains(userId);
+                if (role == "admin") return (Role: role, Permission: (string?)"admin", Associated: true);
+                if (profile.UserAccess.TryGetValue(userId, out var configuredPermission)) return (Role: role, Permission: (string?)configuredPermission, Associated: associated);
+                return (Role: role, Permission: associated ? "edit" : null, Associated: associated);
             });
             var pathParts = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
             var isReadRequest = context.Request.Method is "GET" or "HEAD" or "OPTIONS";
-            var isAllowedOperation = permission == "operate" && context.Request.Method == "POST" && pathParts.Length == 4 &&
-                pathParts[3] is "start" or "restart";
-            if (permission is null || (!isReadRequest && permission != "admin" && permission != "edit" && !isAllowedOperation))
+            var isServerOperation = context.Request.Method == "POST" && pathParts.Length == 4 &&
+                (pathParts[3] is "start" or "stop" or "restart");
+            var isForceStop = context.Request.Method == "POST" && pathParts.Length == 4 && pathParts[3] == "force-stop";
+            var isConsoleCommand = context.Request.Method == "POST" && pathParts.Length == 4 && pathParts[3] == "commands";
+            var isPlayerManagementOperation = context.Request.Method == "POST" && pathParts.Length == 5 &&
+                pathParts[3] == "players" && (pathParts[4] is "admin" or "unadmin" or "ban" or "unban" or "allow" or "unallow" or "kick");
+            var isModUpdateCheck = context.Request.Method == "POST" && pathParts.Length == 5 &&
+                pathParts[3] == "mods" && pathParts[4] == "check-updates";
+            var isGameUpdateOperation = context.Request.Method == "POST" && pathParts.Length == 5 &&
+                pathParts[3] == "game" && (pathParts[4] is "check-updates" or "update" or "abort");
+            var isAllowedOperation = access.Role == "user"
+                ? access.Associated && access.Permission == "operate" &&
+                    (isServerOperation || isForceStop || isConsoleCommand || isPlayerManagementOperation || isModUpdateCheck || isGameUpdateOperation)
+                : access.Permission == "operate" && context.Request.Method == "POST" && pathParts.Length == 4 && (pathParts[3] is "start" or "restart");
+            var canEditProfile = access.Role == "user" && access.Associated && access.Permission == "edit";
+            if (access.Role == "user"
+                    ? !access.Associated || (!isReadRequest && !isAllowedOperation && !canEditProfile)
+                    : access.Permission is null || (!isReadRequest && access.Permission != "admin" && access.Permission != "edit" && !isAllowedOperation))
             {
-                context.Response.StatusCode = StatusCodes.Status404NotFound;
+                context.Response.StatusCode = StatusCodes.Status403Forbidden;
                 return;
             }
         }
@@ -161,7 +197,7 @@ var r2modmanProfiles = app.Services.GetRequiredService<R2ModmanProfileService>()
 var githubReleases = app.Services.GetRequiredService<GitHubReleaseService>();
 
 var elevationStartupId = Guid.NewGuid().ToString("N");
-app.MapGet("/api/health", () => Results.Ok(new { status = "ready", app = "Dedicated Server Studio", shortName = "DSS", version = "0.4.0", startupId = elevationStartupId }));
+app.MapGet("/api/health", () => Results.Ok(new { status = "ready", app = "Dedicated Server Studio", shortName = "DSS", version = "0.4.1", startupId = elevationStartupId }));
 
 app.MapGet("/api/app/elevation/status", (HttpContext context) =>
 {
@@ -202,7 +238,7 @@ async Task<IResult> ChangeElevationAsync(bool enabled, HttpContext context)
         var powerShellPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe");
         if (!File.Exists(powerShellPath)) throw new FileNotFoundException("Windows PowerShell não foi encontrado.", powerShellPath);
         var quotedScriptPath = "\"" + scriptPath.Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
-        var arguments = $"-NoLogo -NoProfile -ExecutionPolicy Bypass -File {quotedScriptPath} -WaitForExistingInstance -PauseOnFailure -ListenMode {listenMode}";
+        var arguments = $"-NoLogo -NoProfile -ExecutionPolicy Bypass -File {quotedScriptPath} -WaitForExistingInstance -PauseOnFailure -ListenMode {listenMode} -PreviousProcessId {Environment.ProcessId}";
         if (enabled)
         {
             var startInfo = new ProcessStartInfo(powerShellPath, arguments)
@@ -238,10 +274,12 @@ async Task<IResult> ChangeElevationAsync(bool enabled, HttpContext context)
                     : signalMessage);
         }
 
-        _ = Task.Run(async () =>
+        // Start the replacement as soon as the 202 response has reached the browser. A fixed
+        // delay here made every elevation switch wait even when the handoff was already ready.
+        context.Response.OnCompleted(() =>
         {
-            await Task.Delay(900);
             app.Lifetime.StopApplication();
+            return Task.CompletedTask;
         });
         return Results.Accepted("/api/health", new { message = enabled
             ? "O painel será reiniciado como administrador."
@@ -351,31 +389,61 @@ app.MapPost("/api/app/update/install", async (HttpContext context, CancellationT
             return Results.Problem("O atualizador desta instalação está ausente. Baixe e instale manualmente a versão mais recente.", statusCode: 500);
 
         archivePath = Path.Combine(Path.GetTempPath(), $"DedicatedServerStudio-{Guid.NewGuid():N}.zip");
-        var sha256 = await githubReleases.DownloadPackageAsync(release, archivePath, cancellationToken);
-        var powerShellPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe");
-        if (!File.Exists(powerShellPath)) throw new FileNotFoundException("Windows PowerShell não foi encontrado.", powerShellPath);
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = powerShellPath,
-            WorkingDirectory = projectRoot,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-            WindowStyle = ProcessWindowStyle.Hidden
-        };
-        foreach (var argument in new[]
-        {
-            "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helperPath,
-            "-ProjectRoot", projectRoot, "-ArchivePath", archivePath, "-ExpectedVersion", release.LatestVersion,
-            "-ExpectedSha256", sha256, "-CurrentProcessId", Environment.ProcessId.ToString(), "-Port", listenPort.ToString()
-        }) startInfo.ArgumentList.Add(argument);
-        using var updater = Process.Start(startInfo) ?? throw new InvalidOperationException("Não foi possível iniciar o processo de atualização.");
-
+        var progress = updateProgress.Begin(release.LatestVersion);
+        var operationId = progress.OperationId;
+        var progressPath = updateProgress.ProgressFilePath;
+        var capturedArchivePath = archivePath;
         _ = Task.Run(async () =>
         {
-            await Task.Delay(1200);
-            app.Lifetime.StopApplication();
+            try
+            {
+                updateProgress.Report(operationId, "downloading", 5, "Baixando pacote", 0, release.PackageSize);
+                long lastProgressTick = 0;
+                var lastProgressPercent = -1;
+                var sha256 = await githubReleases.DownloadPackageAsync(release, capturedArchivePath, CancellationToken.None,
+                    (downloaded, total) =>
+                    {
+                        var percent = total is > 0 ? 5 + (int)Math.Min(40, downloaded * 40 / total.Value) : 12;
+                        var now = Environment.TickCount64;
+                        if (percent != lastProgressPercent || now - lastProgressTick >= 350 || downloaded == total)
+                        {
+                            updateProgress.Report(operationId, "downloading", percent, "Baixando pacote", downloaded, total);
+                            lastProgressPercent = percent;
+                            lastProgressTick = now;
+                        }
+                    });
+                updateProgress.Report(operationId, "verifying", 46, "Pacote baixado e verificado", release.PackageSize, release.PackageSize);
+                var powerShellPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe");
+                if (!File.Exists(powerShellPath)) throw new FileNotFoundException("Windows PowerShell não foi encontrado.", powerShellPath);
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = powerShellPath,
+                    WorkingDirectory = projectRoot,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                foreach (var argument in new[]
+                {
+                    "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helperPath,
+                    "-ProjectRoot", projectRoot, "-ArchivePath", capturedArchivePath, "-ExpectedVersion", release.LatestVersion,
+                    "-ExpectedSha256", sha256, "-CurrentProcessId", Environment.ProcessId.ToString(), "-Port", listenPort.ToString(),
+                    "-ProgressPath", progressPath, "-OperationId", operationId.ToString("D")
+                }) startInfo.ArgumentList.Add(argument);
+                using var updater = Process.Start(startInfo) ?? throw new InvalidOperationException("Não foi possível iniciar o processo de atualização.");
+                updateProgress.Report(operationId, "waiting-for-shutdown", 49, "Preparando a reinicialização do painel");
+                await Task.Delay(1200);
+                app.Lifetime.StopApplication();
+            }
+            catch (Exception ex)
+            {
+                app.Logger.LogError(ex, "Could not prepare DSS update operation {OperationId}", operationId);
+                updateProgress.Report(operationId, "failed", 100, "A atualização falhou", error: ex.Message);
+                try { if (File.Exists(capturedArchivePath)) File.Delete(capturedArchivePath); }
+                catch (Exception cleanupError) { app.Logger.LogWarning(cleanupError, "Could not remove a failed DSS update download"); }
+            }
         });
-        return Results.Accepted("/api/health", new { version = release.LatestVersion, message = "O pacote foi baixado. O DSS será atualizado e reiniciado." });
+        return Results.Accepted($"/api/app/update/progress?operationId={operationId:D}", progress);
     }
     catch (Exception ex) when (ex is HttpRequestException or InvalidDataException or IOException or InvalidOperationException or Win32Exception)
     {
@@ -387,6 +455,14 @@ app.MapPost("/api/app/update/install", async (HttpContext context, CancellationT
         app.Logger.LogError(ex, "Could not prepare DSS update");
         return Results.Problem("Não foi possível preparar a atualização do DSS. " + ex.Message, statusCode: StatusCodes.Status502BadGateway);
     }
+});
+
+app.MapGet("/api/app/update/progress", async (Guid? operationId, HttpContext context) =>
+{
+    if (!await RequireAdmin(context, auth, state)) return Results.Forbid();
+    context.Response.Headers.CacheControl = "no-store, no-cache, must-revalidate";
+    var progress = updateProgress.Get(operationId);
+    return progress is null ? Results.NotFound() : Results.Ok(progress);
 });
 
 app.MapPut("/api/settings/access", async (ListenModeInput input, HttpContext context) =>
@@ -431,6 +507,8 @@ app.MapPut("/api/settings/access", async (ListenModeInput input, HttpContext con
         startInfo.ArgumentList.Add("-File");
         startInfo.ArgumentList.Add(scriptPath);
         startInfo.ArgumentList.Add("-WaitForExistingInstance");
+        startInfo.ArgumentList.Add("-PreviousProcessId");
+        startInfo.ArgumentList.Add(Environment.ProcessId.ToString());
         startInfo.ArgumentList.Add("-ListenMode");
         startInfo.ArgumentList.Add(requestedMode);
         startInfo.ArgumentList.Add("-StartupSignalPath");
@@ -814,7 +892,7 @@ app.MapGet("/api/dashboard", async (HttpContext context) =>
         var preference = data.Users.FirstOrDefault(user => user.Id == userId)?.UiLanguage;
         return string.IsNullOrWhiteSpace(preference) ? "en-US" : preference;
     });
-    var profiles = await state.ReadAsync(data => data.Instances.Where(profile => isAdmin || profile.AllowedUserIds.Contains(userId ?? Guid.Empty)).Select(profile => ToView(profile, supervisor.GetStatus(profile.Id), gameAdapters, state.DataDirectory, steamCmd, supervisor)).ToArray());
+    var profiles = await state.ReadAsync(data => data.Instances.Where(profile => isAdmin || profile.AllowedUserIds.Contains(userId ?? Guid.Empty) || profile.UserAccess.ContainsKey(userId ?? Guid.Empty)).Select(profile => ToView(profile, supervisor.GetStatus(profile.Id), gameAdapters, state.DataDirectory, steamCmd, supervisor)).ToArray());
     var visibleProfileIds = profiles.Select(profile => profile.Id).ToHashSet();
     var revisions = await state.ReadAsync(data => data.Revisions
         .Where(item => IsGlobalRevision(item) && (item.InstanceId == Guid.Empty || visibleProfileIds.Contains(item.InstanceId)))
@@ -999,7 +1077,7 @@ app.MapGet("/api/instances", async (HttpContext context) =>
     if (!RequireAuth(context, auth)) return Results.Unauthorized();
     var userId = auth.GetSessionUserId(context);
     var isAdmin = await state.ReadAsync(data => data.Users.Any(user => user.Id == userId && user.Role == "admin"));
-    return Results.Ok(await state.ReadAsync(data => data.Instances.Where(profile => isAdmin || profile.AllowedUserIds.Contains(userId ?? Guid.Empty)).Select(profile => ToView(profile, supervisor.GetStatus(profile.Id), gameAdapters, state.DataDirectory, steamCmd, supervisor)).ToArray()));
+    return Results.Ok(await state.ReadAsync(data => data.Instances.Where(profile => isAdmin || profile.AllowedUserIds.Contains(userId ?? Guid.Empty) || profile.UserAccess.ContainsKey(userId ?? Guid.Empty)).Select(profile => ToView(profile, supervisor.GetStatus(profile.Id), gameAdapters, state.DataDirectory, steamCmd, supervisor)).ToArray()));
 });
 
 app.MapGet("/api/instances/{id:guid}/servers", async (Guid id, HttpContext context) =>
@@ -1069,12 +1147,26 @@ app.MapDelete("/api/instances/{id:guid}/servers/{serverId:guid}", async (Guid id
 
 app.MapGet("/api/instances/{id:guid}/access", async (Guid id, HttpContext context, bool includeAvailable = false) =>
 {
-    if (!await RequireAdmin(context, auth, state)) return Results.Forbid();
+    if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    var userId = auth.GetSessionUserId(context);
+    var viewer = await state.ReadAsync(data =>
+    {
+        var user = data.Users.FirstOrDefault(item => item.Id == userId);
+        var profile = data.Instances.FirstOrDefault(item => item.Id == id);
+        var isAdmin = user?.Role == "admin";
+        var associated = user is not null && profile is not null &&
+            (profile.UserAccess.ContainsKey(user.Id) || profile.AllowedUserIds.Contains(user.Id));
+        return (ProfileExists: profile is not null, CanView: isAdmin || associated);
+    });
+    if (!viewer.ProfileExists) return Results.NotFound();
+    if (!viewer.CanView || includeAvailable && !(await RequireProfileEditor(id, context, auth, state))) return Results.Forbid();
     var access = await state.ReadAsync(data =>
     {
         var profile = data.Instances.FirstOrDefault(item => item.Id == id);
         if (profile is null) return (Found: false, UserIds: Array.Empty<Guid>(), UserAccess: new Dictionary<Guid, string>(), Users: Array.Empty<UserView>());
         var userAccess = profile.UserAccess.ToDictionary(pair => pair.Key, pair => pair.Value);
+        foreach (var legacyUserId in profile.AllowedUserIds)
+            userAccess.TryAdd(legacyUserId, "edit");
         var selected = userAccess.Keys.ToHashSet();
         var users = data.Users.Where(user => user.Role != "admin" && (includeAvailable || selected.Contains(user.Id)))
             .OrderBy(user => user.Username).Select(user => new UserView(user.Id, user.Username, user.Role, user.CreatedAt, 0,
@@ -1086,7 +1178,7 @@ app.MapGet("/api/instances/{id:guid}/access", async (Guid id, HttpContext contex
 
 app.MapPut("/api/instances/{id:guid}/access", async (Guid id, ProfileUsersInput input, HttpContext context) =>
 {
-    if (!await RequireAdmin(context, auth, state)) return Results.Forbid();
+    if (!await RequireProfileEditor(id, context, auth, state)) return Results.Forbid();
     var updated = await state.UpdateAsync(data =>
     {
         var profile = data.Instances.FirstOrDefault(item => item.Id == id);
@@ -1098,6 +1190,24 @@ app.MapPut("/api/instances/{id:guid}/access", async (Guid id, ProfileUsersInput 
         return true;
     });
     return updated ? Results.Ok(new { message = "Acesso ao perfil atualizado." }) : Results.BadRequest(new { error = "Selecione usuários existentes e defina a permissão de edição ou operação." });
+});
+
+app.MapGet("/api/instances/{id:guid}/my-access", async (Guid id, HttpContext context) =>
+{
+    if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    var userId = auth.GetSessionUserId(context);
+    var access = await state.ReadAsync(data =>
+    {
+        var user = data.Users.FirstOrDefault(item => item.Id == userId);
+        var profile = data.Instances.FirstOrDefault(item => item.Id == id);
+        if (user is null || profile is null) return (Found: false, Permission: (string?)null);
+        if (user.Role == "admin") return (Found: true, Permission: (string?)"admin");
+        if (profile.UserAccess.TryGetValue(user.Id, out var permission)) return (Found: true, Permission: (string?)permission);
+        return profile.AllowedUserIds.Contains(user.Id)
+            ? (Found: true, Permission: (string?)"edit")
+            : (Found: false, Permission: (string?)null);
+    });
+    return access.Found ? Results.Ok(new { permission = access.Permission }) : Results.Forbid();
 });
 
 app.MapGet("/api/instances/{id:guid}/image", async (Guid id, HttpContext context) =>
@@ -1248,7 +1358,7 @@ app.MapPut("/api/instances/{id:guid}", async (Guid id, ProfileInput input, Guid?
 
 app.MapDelete("/api/instances/{id:guid}", async (Guid id, bool? deleteServerFiles, bool? deleteSaves, HttpContext context) =>
 {
-    if (!await RequireAdmin(context, auth, state)) return Results.Forbid();
+    if (!await RequireProfileEditor(id, context, auth, state)) return Results.Forbid();
     if (await IsGroupSteamCmdRunningAsync(id, state, steamCmd)) return Results.Conflict(new { error = "Aguarde a instalação ou atualização do jogo terminar antes de remover o perfil." });
     if (await IsGroupRunningAsync(id, state, supervisor)) return Results.Conflict(new { error = "Pare todas as instâncias do perfil antes de removê-lo." });
     var removal = await state.ReadAsync(data => new
@@ -1315,6 +1425,8 @@ app.MapPost("/api/instances/{id:guid}/start", async (Guid id, Guid? serverId, Ht
     var executablePath = Path.Combine(profile.InstallPath, adapter.ExecutableName);
     if (!File.Exists(executablePath))
     {
+        var isStandardUser = await state.ReadAsync(data => data.Users.Any(user => user.Id == auth.GetSessionUserId(context) && user.Role == "user"));
+        if (isStandardUser) return Results.Forbid();
         var installation = await steamCmd.BeginInstallAsync(id, startAfterInstall: true, endpoint.Id);
         if (installation.Started) await state.UpdateAsync(data => { data.Revisions.Add(new ConfigRevision { InstanceId = id, Kind = "profile-action", Target = "jogo", Summary = "Instalação do servidor solicitada ao iniciar", CanRollback = false }); return true; });
         return installation.Started
@@ -1330,7 +1442,7 @@ app.MapPost("/api/instances/{id:guid}/start", async (Guid id, Guid? serverId, Ht
 
 app.MapPost("/api/instances/{id:guid}/firewall/authorize", async (Guid id, Guid? serverId, HttpContext context) =>
 {
-    if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    if (!await RequireProfileEditor(id, context, auth, state)) return Results.Forbid();
     var root = await state.ReadAsync(data => data.Instances.FirstOrDefault(item => item.Id == id));
     var endpoint = root?.Servers.FirstOrDefault(server => server.Id == serverId) ?? root?.Servers.FirstOrDefault(server => server.Id == id) ?? root?.Servers.FirstOrDefault();
     if (root is null || endpoint is null) return Results.NotFound();
@@ -1374,6 +1486,19 @@ app.MapPost("/api/instances/{id:guid}/game/check-updates", async (Guid id, HttpC
 app.MapPost("/api/instances/{id:guid}/game/update", async (Guid id, HttpContext context) =>
 {
     if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    var canInstallServer = await RequireProfileEditor(id, context, auth, state);
+    if (!canInstallServer)
+    {
+        var hasInstalledServer = await state.ReadAsync(data =>
+        {
+            var profile = data.Instances.FirstOrDefault(item => item.Id == id);
+            return profile is not null && gameAdapters.TryGet(profile.GameId, out var adapter) &&
+                !string.IsNullOrWhiteSpace(profile.InstallPath) &&
+                File.Exists(Path.Combine(profile.InstallPath, adapter.ExecutableName));
+        });
+        if (!hasInstalledServer)
+            return Results.Conflict(new { error = "Este acesso pode atualizar um servidor já instalado, mas não instalar um servidor ausente." });
+    }
     if (await IsGroupRunningAsync(id, state, supervisor)) return Results.Conflict(new { error = "Pare todos os servidores deste perfil antes de atualizar os arquivos compartilhados do jogo." });
     if (await IsGroupSteamCmdRunningAsync(id, state, steamCmd)) return Results.Conflict(new { error = "Já existe uma operação do SteamCMD para este perfil." });
     var installation = await steamCmd.BeginInstallAsync(id, startAfterInstall: false);
@@ -1507,7 +1632,7 @@ app.MapGet("/api/instances/{id:guid}/console/log-file", (Guid id, Guid? serverId
 
 app.MapPost("/api/instances/{id:guid}/commands", async (Guid id, Guid? serverId, ConsoleCommandInput input, HttpContext context) =>
 {
-    if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    if (!await RequireProfileEditor(id, context, auth, state) && !await RequireProfileOperator(id, context, auth, state)) return Results.Forbid();
     var modOwnerId = await ResolveModOwnerIdAsync(id, state);
     if (modOwnerId is null) return Results.NotFound();
     var consoleModReady = await state.ReadAsync(data => data.InstalledMods.Any(mod => mod.InstanceId == modOwnerId &&
@@ -1544,7 +1669,7 @@ app.MapGet("/api/instances/{id:guid}/players", async (Guid id, Guid? serverId, H
 app.MapPost("/api/instances/{id:guid}/players/{action}", async (Guid id, string action, Guid? serverId, PlayerAccessInput input,
     HttpContext context, CancellationToken cancellationToken) =>
 {
-    if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    if (!await RequireProfileEditor(id, context, auth, state) && !await RequireProfileOperator(id, context, auth, state)) return Results.Forbid();
     var root = await state.ReadAsync(data => data.Instances.FirstOrDefault(item => item.Id == id));
     var endpoint = root?.Servers.FirstOrDefault(item => item.Id == serverId) ?? root?.Servers.FirstOrDefault(item => item.Id == id) ?? root?.Servers.FirstOrDefault();
     if (root is null || endpoint is null) return Results.NotFound();
@@ -2478,7 +2603,8 @@ app.MapPut("/api/instances/{id:guid}/configs/{**relativePath}", async (Guid id, 
     if (profile is null) return Results.NotFound();
     var path = SafeConfigPath(profile, relativePath);
     if (path is null || !IsEditableConfig(path)) return Results.BadRequest(new { error = "Caminho de configuração inválido." });
-    if (input.Content.Length > 1_000_000) return Results.BadRequest(new { error = "O arquivo de configuração excede 1 MB." });
+    if (System.Text.Encoding.UTF8.GetByteCount(input.Content) > 10 * 1024 * 1024)
+        return Results.BadRequest(new { error = "O arquivo de configuração excede 10 MB." });
     var existed = File.Exists(path);
     var before = existed ? await File.ReadAllTextAsync(path) : "";
     var directory = Path.GetDirectoryName(path)!;
@@ -3034,6 +3160,38 @@ static async Task<bool> RequireAdmin(HttpContext context, AuthService auth, Stat
     var userId = auth.GetSessionUserId(context);
     if (userId is null) return false;
     return await state.ReadAsync(data => data.Users.Any(user => user.Id == userId && user.Role == "admin"));
+}
+
+static async Task<bool> RequireProfileEditor(Guid profileId, HttpContext context, AuthService auth, StateStore state)
+{
+    var userId = auth.GetSessionUserId(context);
+    if (userId is null) return false;
+    return await state.ReadAsync(data =>
+    {
+        var user = data.Users.FirstOrDefault(item => item.Id == userId);
+        if (user?.Role == "admin") return true;
+        if (user?.Role != "user") return false;
+        var profile = data.Instances.FirstOrDefault(item => item.Id == profileId);
+        if (profile is null) return false;
+        if (profile.UserAccess.TryGetValue(user.Id, out var permission)) return permission == "edit";
+        return profile.AllowedUserIds.Contains(user.Id);
+    });
+}
+
+static async Task<bool> RequireProfileOperator(Guid profileId, HttpContext context, AuthService auth, StateStore state)
+{
+    var userId = auth.GetSessionUserId(context);
+    if (userId is null) return false;
+    return await state.ReadAsync(data =>
+    {
+        var user = data.Users.FirstOrDefault(item => item.Id == userId);
+        if (user?.Role == "admin") return true;
+        if (user?.Role != "user") return false;
+        var profile = data.Instances.FirstOrDefault(item => item.Id == profileId);
+        if (profile is null) return false;
+        if (profile.UserAccess.TryGetValue(user.Id, out var permission)) return permission is "edit" or "operate";
+        return profile.AllowedUserIds.Contains(user.Id);
+    });
 }
 
 static string QuoteConsoleArgument(string value) => "\"" + value.Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";

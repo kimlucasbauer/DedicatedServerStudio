@@ -35,6 +35,7 @@ public sealed class InstanceSupervisor(StateStore state, GameAdapterRegistry ada
             var instanceDirectory = InstanceDirectory(profile.Id);
             var statusPath = Path.Combine(instanceDirectory, "console-bridge.json");
             var recovered = false;
+            var preserveBridgeRecord = false;
             if (File.Exists(statusPath))
             {
                 try
@@ -42,7 +43,12 @@ public sealed class InstanceSupervisor(StateStore state, GameAdapterRegistry ada
                     var status = JsonSerializer.Deserialize<ConsoleBridgeStatus>(await File.ReadAllTextAsync(statusPath), BridgeJsonOptions);
                     if (status is not null)
                     {
-                        var managed = await ConsoleBridgeManagedProcess.TryRecoverAsync(ConsolePipeName(profile.Id), status);
+                        var expectedExecutable = adapters.TryGet(profile.GameId, out var adapter) && !string.IsNullOrWhiteSpace(profile.InstallPath)
+                            ? Path.Combine(profile.InstallPath, adapter.ExecutableName)
+                            : null;
+                        preserveBridgeRecord = ConsoleBridgeManagedProcess.IsBridgeAlive(status.BridgeProcessId) &&
+                            ConsoleBridgeManagedProcess.HasLiveServer(status, expectedExecutable);
+                        var managed = await ConsoleBridgeManagedProcess.TryRecoverAsync(ConsolePipeName(profile.Id), status, expectedExecutable);
                         if (managed is not null)
                         {
                             RegisterRecoveredProcess(profile.Id, instanceDirectory, managed, status.LogPath);
@@ -60,7 +66,7 @@ public sealed class InstanceSupervisor(StateStore state, GameAdapterRegistry ada
             if (recovered)
                 continue;
 
-            TryDelete(statusPath);
+            if (!preserveBridgeRecord) TryDelete(statusPath);
             if (!TryRecoverLegacyProcess(profile, udpOwners, out var legacy))
                 continue;
 

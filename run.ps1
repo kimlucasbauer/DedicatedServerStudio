@@ -5,6 +5,7 @@
     [string]$ListenMode,
     [string]$AssemblyPath,
     [switch]$WaitForExistingInstance,
+    [int]$PreviousProcessId = 0,
     [string]$StartupSignalPath,
     [switch]$RequireNonAdministrator,
     [switch]$PauseOnFailure
@@ -32,6 +33,22 @@ function Resolve-DssAssembly([string]$ConfiguredPath, [string]$ExpectedHash) {
     $actualHash = (Get-FileHash -LiteralPath $resolvedPath -Algorithm SHA256).Hash
     if ($actualHash -ne $ExpectedHash) { throw 'The active build was replaced. Restore the build listed in dss-runtime.json or select a newly approved build.' }
     return $resolvedPath
+}
+
+function Test-DssProcessIdentity([int]$ProcessId) {
+    if ($ProcessId -le 0) { return $false }
+    try {
+        $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        if ($null -eq $processInfo) { return $false }
+        $image = [string]$processInfo.ExecutablePath
+        $command = [string]$processInfo.CommandLine
+        $rootPrefix = [IO.Path]::GetFullPath($projectRoot).TrimEnd('\') + '\'
+        $belongsToDss = ($image -and $image.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) -or
+            ($command -and $command.IndexOf($rootPrefix, [StringComparison]::OrdinalIgnoreCase) -ge 0)
+        $isDssHost = ([IO.Path]::GetFileNameWithoutExtension($image) -in @('DedicatedServerStudio', 'dotnet')) -and
+            ($command -match 'DedicatedServerStudio(?:\.dll|\.exe)')
+        return $belongsToDss -and $isDssHost
+    } catch { return $false }
 }
 
 function Write-StartupSignal([bool]$Ready, [bool]$IsAdministrator, [string]$Message = '') {
@@ -67,6 +84,7 @@ try {
     $logsDirectory = Join-Path $projectRoot 'logs'
     New-Item -ItemType Directory -Path $logsDirectory -Force | Out-Null
     $launchLog = Join-Path $logsDirectory "dss-startup-$(Get-Date -Format yyyy-MM-dd).log"
+    $restartHandoffMarker = Join-Path $logsDirectory 'dss-restart-handoff.json'
 
     $dssConfigPath = Join-Path $projectRoot 'dss-config.json'
     $runAsAdministrator = $false
@@ -149,17 +167,77 @@ try {
     $launchMutex = [Threading.Mutex]::new($false, "Local\DedicatedServerStudio-Launcher-$($listenUri.Port)")
     if ($WaitForExistingInstance) {
         $waitUntil = (Get-Date).AddSeconds(90)
+        $forceStopAfter = (Get-Date).AddSeconds(2)
+        $forceStopAttempted = $false
+        $previousProcess = $null
+        if ($PreviousProcessId -gt 0) {
+            try { $previousProcess = Get-Process -Id $PreviousProcessId -ErrorAction Stop }
+            catch { $previousProcess = $null }
+        }
         Write-LaunchMessage 'Waiting for the current DSS instance to close before restarting with the selected permission mode.'
         do {
+            $previousProcessExited = $true
+            if ($previousProcess) {
+                try { $previousProcess.Refresh(); $previousProcessExited = $previousProcess.HasExited }
+                catch { $previousProcessExited = $true }
+            }
+            if (-not $previousProcessExited) {
+                if (-not $forceStopAttempted -and $PreviousProcessId -gt 0 -and (Get-Date) -ge $forceStopAfter -and
+                    (Test-DssProcessIdentity $PreviousProcessId)) {
+                    $listener = Get-NetTCPConnection -LocalPort $listenUri.Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if (-not $listener -or [int]$listener.OwningProcess -eq $PreviousProcessId) {
+                        Write-LaunchMessage "The previous DSS host (PID $PreviousProcessId) remained open after shutdown. Stopping that verified process so the restart can continue."
+                        try {
+                            $handoff = @{ previousProcessId = $PreviousProcessId; listenPort = $listenUri.Port; requestedAtUtc = [DateTimeOffset]::UtcNow.ToString('o') } | ConvertTo-Json -Compress
+                            [IO.File]::WriteAllText($restartHandoffMarker, $handoff, [Text.UTF8Encoding]::new($false))
+                        }
+                        catch { Write-LaunchMessage "Could not record the verified restart handoff: $($_.Exception.Message)" }
+                        try { Stop-Process -Id $PreviousProcessId -Force -ErrorAction Stop }
+                        catch {
+                            $stopError = $_
+                            try {
+                                $handoff = Get-Content -LiteralPath $restartHandoffMarker -Raw | ConvertFrom-Json
+                                if ([int]$handoff.previousProcessId -eq $PreviousProcessId) { Remove-Item -LiteralPath $restartHandoffMarker -Force -ErrorAction SilentlyContinue }
+                            }
+                            catch { }
+
+                            $previousProcessExitedAfterStopRace = $false
+                            if ($previousProcess) {
+                                try { $previousProcess.Refresh(); $previousProcessExitedAfterStopRace = $previousProcess.HasExited }
+                                catch { $previousProcessExitedAfterStopRace = $true }
+                            }
+                            if ($previousProcessExitedAfterStopRace) {
+                                Write-LaunchMessage "The previous DSS host (PID $PreviousProcessId) exited before the stop request completed. Continuing the restart."
+                            }
+                            elseif (-not (Test-DssProcessIdentity $PreviousProcessId)) {
+                                Write-LaunchMessage "PID $PreviousProcessId no longer identifies the previous DSS host. Leaving that process untouched and continuing the handoff."
+                            }
+                            else {
+                                throw $stopError
+                            }
+                        }
+                        $forceStopAttempted = $true
+                        Start-Sleep -Milliseconds 100
+                    }
+                }
+                if ((Get-Date) -ge $waitUntil) { throw 'The current DSS instance did not close in time. Close the previous instance and try again.' }
+                if ($previousProcess) { $null = $previousProcess.WaitForExit(150) }
+                else { Start-Sleep -Milliseconds 150 }
+                continue
+            }
+
+            # Avoid repeated TCP table scans while the old host is still shutting down.
+            # Its process handle and the launcher mutex give us cheap, reliable wait signals.
             $listener = Get-NetTCPConnection -LocalPort $listenUri.Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
             if (-not $listener) {
-                try { $ownsLaunchMutex = $launchMutex.WaitOne(500) }
+                try { $ownsLaunchMutex = $launchMutex.WaitOne(150) }
                 catch [Threading.AbandonedMutexException] { $ownsLaunchMutex = $true }
                 if ($ownsLaunchMutex) { break }
             }
             if ((Get-Date) -ge $waitUntil) { throw 'The current DSS instance did not close in time. Close the previous instance and try again.' }
-            Start-Sleep -Milliseconds 300
+            Start-Sleep -Milliseconds 100
         } while ($true)
+        if ($previousProcess) { $previousProcess.Dispose() }
     }
     else {
         try { $ownsLaunchMutex = $launchMutex.WaitOne(0) }
@@ -191,6 +269,7 @@ try {
         $arguments = @('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $scriptPath + '"'))
         $arguments += @('-ListenMode', $ListenMode)
         if ($WaitForExistingInstance) { $arguments += '-WaitForExistingInstance' }
+        if ($PreviousProcessId -gt 0) { $arguments += @('-PreviousProcessId', [string]$PreviousProcessId) }
         if (-not [string]::IsNullOrWhiteSpace($AssemblyPath)) { $arguments += @('-AssemblyPath', ('"' + $AssemblyPath + '"')) }
         if ($RequireNonAdministrator) { $arguments += '-RequireNonAdministrator' }
         if (-not [string]::IsNullOrWhiteSpace($StartupSignalPath)) { $arguments += @('-StartupSignalPath', ('"' + $StartupSignalPath + '"')) }
@@ -234,6 +313,18 @@ try {
         $ErrorActionPreference = 'Stop'
     }
     finally { Pop-Location }
+    if ($exitCode -ne 0 -and (Test-Path -LiteralPath $restartHandoffMarker -PathType Leaf)) {
+        try {
+            $handoff = Get-Content -LiteralPath $restartHandoffMarker -Raw | ConvertFrom-Json
+            $handoffAge = [DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse([string]$handoff.requestedAtUtc)
+            if ([int]$handoff.listenPort -eq $listenUri.Port -and $handoffAge -ge [TimeSpan]::Zero -and $handoffAge -lt [TimeSpan]::FromSeconds(45)) {
+                Write-LaunchMessage "The DSS host exited with code $exitCode during the verified permission-mode handoff. The replacement instance is starting in the other window."
+                Remove-Item -LiteralPath $restartHandoffMarker -Force -ErrorAction SilentlyContinue
+                $exitCode = 0
+            }
+        }
+        catch { Write-LaunchMessage "Could not validate the DSS restart handoff marker: $($_.Exception.Message)" }
+    }
     Write-LaunchMessage "DSS exited with code $exitCode."
 }
 catch {

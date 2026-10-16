@@ -28,12 +28,14 @@ public sealed class ConsoleBridgeManagedProcess : IManagedServerProcess
     }
 
     public Process Process { get; }
-    public bool ConsoleConnected => true;
+    public bool ConsoleConnected => !HasExited && IsBridgeAlive(_bridgeProcessId);
     public bool HasExited
     {
         get
         {
-            try { Process.Refresh(); return Process.HasExited || !IsBridgeAlive(_bridgeProcessId); }
+            // Losing the console bridge must not make a still-running game look stopped:
+            // that could let DSS launch a duplicate server over the existing world.
+            try { Process.Refresh(); return Process.HasExited; }
             catch (InvalidOperationException) { return true; }
         }
     }
@@ -72,12 +74,13 @@ public sealed class ConsoleBridgeManagedProcess : IManagedServerProcess
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
     }
 
-    public static async Task<ConsoleBridgeManagedProcess?> TryRecoverAsync(string pipeName, ConsoleBridgeStatus status)
+    public static async Task<ConsoleBridgeManagedProcess?> TryRecoverAsync(string pipeName, ConsoleBridgeStatus status,
+        string? expectedExecutable = null)
     {
         var retryUntil = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(10);
         while (DateTimeOffset.UtcNow < retryUntil)
         {
-            if (!IsBridgeAlive(status.BridgeProcessId)) return null;
+            if (!IsBridgeAlive(status.BridgeProcessId) || !HasLiveServer(status, expectedExecutable)) return null;
             try
             {
                 var response = await SendRequestAsync(pipeName, new ConsoleBridgeRequest("status"), TimeSpan.FromMilliseconds(700));
@@ -91,7 +94,31 @@ public sealed class ConsoleBridgeManagedProcess : IManagedServerProcess
             }
             await Task.Delay(150);
         }
-        return null;
+
+        // A server can keep running while an old DSS build is being replaced. If its
+        // bridge and game process still match the saved record, retain the reconnect
+        // handle even when the pipe was briefly unavailable during startup.
+        return IsBridgeAlive(status.BridgeProcessId) && HasLiveServer(status, expectedExecutable)
+            ? new ConsoleBridgeManagedProcess(pipeName, status.BridgeProcessId, System.Diagnostics.Process.GetProcessById(status.ServerProcessId))
+            : null;
+    }
+
+    public static bool HasLiveServer(ConsoleBridgeStatus status, string? expectedExecutable = null)
+    {
+        try
+        {
+            using var server = System.Diagnostics.Process.GetProcessById(status.ServerProcessId);
+            if (server.HasExited) return false;
+            if (!string.IsNullOrWhiteSpace(expectedExecutable) &&
+                !string.Equals(Path.GetFullPath(server.MainModule?.FileName ?? ""), Path.GetFullPath(expectedExecutable), StringComparison.OrdinalIgnoreCase))
+                return false;
+            // Reject a PID that was reused after the bridge record was written.
+            return server.StartTime.ToUniversalTime() <= status.StartedAt.UtcDateTime.AddMinutes(1);
+        }
+        catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception or NotSupportedException)
+        {
+            return false;
+        }
     }
 
     public async Task SendCommandAsync(string command)
@@ -103,11 +130,21 @@ public sealed class ConsoleBridgeManagedProcess : IManagedServerProcess
     public async Task<bool> SendCtrlBreakAsync(TimeSpan timeout)
     {
         var seconds = (int)Math.Clamp(Math.Ceiling(timeout.TotalSeconds), 1, 60);
-        var response = await SendRequestAsync(_pipeName, new ConsoleBridgeRequest("ctrl-break", TimeoutSeconds: seconds), timeout + TimeSpan.FromSeconds(3));
-        return response?.Success == true;
+        try
+        {
+            var response = await SendRequestAsync(_pipeName, new ConsoleBridgeRequest("ctrl-break", TimeoutSeconds: seconds), timeout + TimeSpan.FromSeconds(3));
+            if (response?.Success == true) return true;
+        }
+        catch (Exception ex) when (ex is IOException or TimeoutException or OperationCanceledException or InvalidOperationException or ObjectDisposedException)
+        {
+            // The panel may have been reinstalled while the server stayed alive. Its
+            // bridge can be unavailable even though the server still has a console.
+        }
+
+        return !HasExited && await ManagedServerProcess.SendCtrlBreakToProcessAsync(Process, timeout);
     }
 
-    private static bool IsBridgeAlive(int processId)
+    public static bool IsBridgeAlive(int processId)
     {
         try { using var process = System.Diagnostics.Process.GetProcessById(processId); return !process.HasExited; }
         catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or System.ComponentModel.Win32Exception) { return false; }

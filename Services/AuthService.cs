@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.Json;
 using DedicatedServerStudio.Models;
 
 namespace DedicatedServerStudio.Services;
@@ -13,7 +14,10 @@ public sealed class AuthService(StateStore store)
     private const int LoginLockoutThreshold = 10;
     private const int MaxFailedLoginAuditEntries = 1_000;
     private sealed record SessionState(DateTimeOffset ExpiresAt, Guid UserId);
-    private readonly ConcurrentDictionary<string, SessionState> _sessions = new(StringComparer.Ordinal);
+    private sealed record PersistedSession(string TokenHash, DateTimeOffset ExpiresAt, Guid UserId);
+    private readonly object _sessionFileLock = new();
+    private readonly string _sessionFilePath = Path.Combine(store.DataDirectory, "auth-sessions.json");
+    private readonly ConcurrentDictionary<string, SessionState> _sessions = LoadPersistedSessions(Path.Combine(store.DataDirectory, "auth-sessions.json"));
     private static readonly string DummyPasswordHash = HashPassword("DSS dummy credential used only to normalize failed-login work");
 
     public Task<bool> IsSetupAsync() => store.ReadAsync(data => data.Users.Any(user => user.Role == "admin") || !string.IsNullOrWhiteSpace(data.AdminPasswordHash));
@@ -186,12 +190,60 @@ public sealed class AuthService(StateStore store)
             : value.Trim();
     }
 
+    private static string HashSessionToken(string token) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token)));
+
+    private static ConcurrentDictionary<string, SessionState> LoadPersistedSessions(string path)
+    {
+        var sessions = new ConcurrentDictionary<string, SessionState>(StringComparer.Ordinal);
+        if (!File.Exists(path)) return sessions;
+        try
+        {
+            var persisted = JsonSerializer.Deserialize<PersistedSession[]>(File.ReadAllText(path)) ?? [];
+            foreach (var session in persisted)
+            {
+                if (session.UserId == Guid.Empty || session.ExpiresAt <= DateTimeOffset.UtcNow || session.TokenHash.Length != 64 ||
+                    !session.TokenHash.All(Uri.IsHexDigit)) continue;
+                sessions[session.TokenHash] = new SessionState(session.ExpiresAt, session.UserId);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+        {
+            // A corrupt session cache only requires users to sign in again; the account data stays intact.
+        }
+        return sessions;
+    }
+
+    private void PersistSessions()
+    {
+        lock (_sessionFileLock)
+        {
+            var directory = Path.GetDirectoryName(_sessionFilePath)!;
+            Directory.CreateDirectory(directory);
+            var temporaryPath = _sessionFilePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            try
+            {
+                var sessions = _sessions.Select(pair => new PersistedSession(pair.Key, pair.Value.ExpiresAt, pair.Value.UserId)).ToArray();
+                File.WriteAllText(temporaryPath, JsonSerializer.Serialize(sessions));
+                File.Move(temporaryPath, _sessionFilePath, overwrite: true);
+            }
+            finally
+            {
+                if (File.Exists(temporaryPath)) File.Delete(temporaryPath);
+            }
+        }
+    }
+
     public string CreateSession(HttpContext context, Guid userId)
     {
         var token = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
         var now = DateTimeOffset.UtcNow;
-        foreach (var expired in _sessions.Where(item => item.Value.ExpiresAt <= now).Select(item => item.Key)) _sessions.TryRemove(expired, out _);
-        _sessions[token] = new SessionState(now.AddHours(12), userId);
+        lock (_sessionFileLock)
+        {
+            foreach (var expired in _sessions.Where(item => item.Value.ExpiresAt <= now).Select(item => item.Key)) _sessions.TryRemove(expired, out _);
+            _sessions[HashSessionToken(token)] = new SessionState(now.AddHours(12), userId);
+            PersistSessions();
+        }
         context.Response.Cookies.Append("vhs_session", token, new CookieOptions
         {
             HttpOnly = true,
@@ -211,10 +263,14 @@ public sealed class AuthService(StateStore store)
     public Guid? GetSessionUserId(HttpContext context)
     {
         var token = context.Request.Cookies["vhs_session"];
-        if (token is null || !_sessions.TryGetValue(token, out var session)) return null;
+        if (token is null || !_sessions.TryGetValue(HashSessionToken(token), out var session)) return null;
         if (session.ExpiresAt <= DateTimeOffset.UtcNow)
         {
-            _sessions.TryRemove(token, out _);
+            lock (_sessionFileLock)
+            {
+                _sessions.TryRemove(HashSessionToken(token), out _);
+                try { PersistSessions(); } catch (IOException) { }
+            }
             return null;
         }
         return session.UserId;
@@ -223,7 +279,14 @@ public sealed class AuthService(StateStore store)
     public void SignOut(HttpContext context)
     {
         var token = context.Request.Cookies["vhs_session"];
-        if (token is not null) _sessions.TryRemove(token, out _);
+        if (token is not null)
+        {
+            lock (_sessionFileLock)
+            {
+                _sessions.TryRemove(HashSessionToken(token), out _);
+                try { PersistSessions(); } catch (IOException) { }
+            }
+        }
         context.Response.Cookies.Delete("vhs_session", new CookieOptions { SameSite = SameSiteMode.Strict, Secure = context.Request.IsHttps });
     }
 }

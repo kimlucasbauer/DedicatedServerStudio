@@ -46,7 +46,7 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 timeout.CancelAfter(TimeSpan.FromSeconds(7));
                 using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
-                request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
+                request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
                 using var response = await clients.CreateClient("catalog").SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
                 var connection = response.StatusCode == HttpStatusCode.TooManyRequests ? "rate-limited"
                     : response.IsSuccessStatusCode ? "reachable" : "unavailable";
@@ -89,12 +89,12 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
             ? "https://api.nexusmods.com/v1/users/validate.json"
             : "https://api.curseforge.com/v1/games/455";
         using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
-        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
+        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
         if (provider.Id == "nexus")
         {
             request.Headers.TryAddWithoutValidation("apikey", key);
             request.Headers.TryAddWithoutValidation("Application-Name", "Dedicated Server Studio");
-            request.Headers.TryAddWithoutValidation("Application-Version", "0.4.0");
+            request.Headers.TryAddWithoutValidation("Application-Version", "0.4.1");
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         }
         else request.Headers.TryAddWithoutValidation("x-api-key", key);
@@ -326,7 +326,7 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
             _ => throw new ProviderException("Este provedor não disponibiliza pacotes compatíveis com Thunderstore.")
         };
         using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
-        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0 (+self-hosted Valheim server manager)");
+        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1 (+self-hosted Valheim server manager)");
         using var response = await clients.CreateClient("catalog").SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         if (response.StatusCode == HttpStatusCode.NotFound) return null;
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
@@ -671,8 +671,8 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
     {
         request.Headers.TryAddWithoutValidation("apikey", apiKey);
         request.Headers.TryAddWithoutValidation("Application-Name", "Dedicated Server Studio");
-        request.Headers.TryAddWithoutValidation("Application-Version", "0.4.0");
-        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
+        request.Headers.TryAddWithoutValidation("Application-Version", "0.4.1");
+        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1");
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
     }
 
@@ -714,7 +714,7 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
             _ => throw new ProviderException("Este provedor não disponibiliza pacotes compatíveis com Thunderstore.")
         };
         using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
-        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0 (+self-hosted Valheim server manager)");
+        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.1 (+self-hosted Valheim server manager)");
         using var response = await clients.CreateClient("catalog").SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
             throw new ProviderException($"{(normalized == "hexium" ? "Hexium" : "Thunderstore")} pediu uma pausa. Aguarde o Retry-After informado pelo provedor antes de tentar novamente.");
