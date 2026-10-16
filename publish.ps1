@@ -26,5 +26,34 @@ try {
     & dotnet publish .\DedicatedServerStudio.csproj -c Release --no-restore -p:RestoreConfigFile=NuGet.Config `
         -p:UseAppHost=false -o .\publish\web
     if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed with exit code $LASTEXITCODE" }
+
+    $builtAssembly = Join-Path $projectRoot 'bin\Release\net10.0\DedicatedServerStudio.dll'
+    if (-not (Test-Path -LiteralPath $builtAssembly -PathType Leaf)) { throw 'Built DSS assembly was not found.' }
+    $developmentManifest = [ordered]@{
+        assemblyPath = 'bin/Release/net10.0/DedicatedServerStudio.dll'
+        sha256 = (Get-FileHash -LiteralPath $builtAssembly -Algorithm SHA256).Hash
+        builtAt = (Get-Date).ToString('o')
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $projectRoot 'dss-runtime.json'),
+        ($developmentManifest | ConvertTo-Json -Depth 3),
+        [Text.UTF8Encoding]::new($false)
+    )
+
+    # The source manifest identifies the development build. A production package runs
+    # the published assembly from its root, so generate a matching manifest here.
+    $publishedAssembly = Join-Path $webOutput 'DedicatedServerStudio.dll'
+    if (-not (Test-Path -LiteralPath $publishedAssembly -PathType Leaf)) { throw 'Published DSS assembly was not found.' }
+    $publishedHash = (Get-FileHash -LiteralPath $publishedAssembly -Algorithm SHA256).Hash
+    $runtimeManifest = [ordered]@{
+        assemblyPath = 'DedicatedServerStudio.dll'
+        sha256 = $publishedHash
+        builtAt = (Get-Date).ToString('o')
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $webOutput 'dss-runtime.json'),
+        ($runtimeManifest | ConvertTo-Json -Depth 3),
+        [Text.UTF8Encoding]::new($false)
+    )
 }
 finally { Pop-Location }

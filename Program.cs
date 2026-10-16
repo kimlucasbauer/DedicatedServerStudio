@@ -49,7 +49,7 @@ builder.Services.AddSingleton<PlayerManagementService>();
 builder.Services.AddHttpClient("steamcmd", client =>
 {
     client.Timeout = TimeSpan.FromMinutes(10);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.3.6");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
 });
 builder.Services.AddSingleton<SteamCmdService>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<SteamCmdService>());
@@ -59,22 +59,27 @@ builder.Services.AddSingleton<ModPackageManager>();
 builder.Services.AddHttpClient("catalog", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(18);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.3.6");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
 });
 builder.Services.AddHttpClient("mod-download", client =>
 {
     client.Timeout = Timeout.InfiniteTimeSpan;
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.3.6");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
 });
 builder.Services.AddHttpClient("r2modman", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(45);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.3.6");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
+});
+builder.Services.AddHttpClient("public-ip", client =>
+{
+    client.Timeout = TimeSpan.FromSeconds(4);
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
 });
 builder.Services.AddHttpClient<GitHubReleaseService>(client =>
 {
     client.Timeout = TimeSpan.FromSeconds(45);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.3.6");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
     client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
 });
 builder.Services.AddSingleton<R2ModmanProfileService>();
@@ -156,7 +161,7 @@ var r2modmanProfiles = app.Services.GetRequiredService<R2ModmanProfileService>()
 var githubReleases = app.Services.GetRequiredService<GitHubReleaseService>();
 
 var elevationStartupId = Guid.NewGuid().ToString("N");
-app.MapGet("/api/health", () => Results.Ok(new { status = "ready", app = "Dedicated Server Studio", shortName = "DSS", version = "0.3.6", startupId = elevationStartupId }));
+app.MapGet("/api/health", () => Results.Ok(new { status = "ready", app = "Dedicated Server Studio", shortName = "DSS", version = "0.4.0", startupId = elevationStartupId }));
 
 app.MapGet("/api/app/elevation/status", (HttpContext context) =>
 {
@@ -313,10 +318,21 @@ app.MapPost("/api/app/update/install", async (HttpContext context, CancellationT
     if (!OperatingSystem.IsWindows()) return Results.BadRequest(new { error = "A atualização automática está disponível somente no Windows." });
 
     var profiles = await state.ReadAsync(data => data.Instances.ToArray());
-    var activeServer = profiles.SelectMany(profile => profile.Servers).FirstOrDefault(server =>
-        supervisor.GetStatus(server.Id) is "running" or "starting" or "stopping");
-    if (activeServer is not null)
-        return Results.Conflict(new { error = "Pare todos os servidores do DSS antes de instalar a atualização." });
+    var activeServerWithoutBridge = profiles
+        .SelectMany(profile => profile.Servers.Count == 0 ? [profile] : profile.Servers.Select(profile.WithServer))
+        .FirstOrDefault(server =>
+        {
+            var status = supervisor.GetStatus(server.Id);
+            return status is "starting" or "stopping" || status == "running" && !supervisor.IsConsoleConnected(server.Id);
+        });
+    if (activeServerWithoutBridge is not null)
+    {
+        var serverStatus = supervisor.GetStatus(activeServerWithoutBridge.Id);
+        var error = serverStatus is "starting" or "stopping"
+            ? $"Aguarde o servidor '{activeServerWithoutBridge.ServerName}' terminar de iniciar ou parar antes de atualizar o painel."
+            : $"O servidor '{activeServerWithoutBridge.ServerName}' não tem uma ponte de console persistente disponível. Reinicie-o uma vez nesta versão do DSS antes de atualizar o painel; depois, console e Gestão poderão se reconectar sem reiniciar o jogo.";
+        return Results.Conflict(new { error });
+    }
     if (profiles.Any(profile => steamCmd.GetOperation(profile.Id)?.Running == true))
         return Results.Conflict(new { error = "Aguarde a operação do SteamCMD terminar antes de atualizar o DSS." });
 
@@ -542,7 +558,8 @@ app.MapGet("/api/auth/me", async (HttpContext context) =>
     if (user is null) return Results.Unauthorized();
     var imagePath = UserProfileImagePath(state.DataDirectory, id);
     var imageUrl = File.Exists(imagePath) ? $"/api/auth/me/image?v={File.GetLastWriteTimeUtc(imagePath).Ticks}" : null;
-    return Results.Ok(new { id = user.Id, username = user.Username, role = user.Role, imageUrl });
+    var uiLanguage = string.IsNullOrWhiteSpace(user.UiLanguage) ? "en-US" : user.UiLanguage;
+    return Results.Ok(new { id = user.Id, username = user.Username, role = user.Role, imageUrl, uiLanguage });
 });
 
 app.MapGet("/api/auth/me/image", (HttpContext context) =>
@@ -663,6 +680,8 @@ app.MapPost("/api/users", async (UserCreateInput input, HttpContext context) =>
     if (input.Password is null || input.Password.Length < 11 || input.Password.Length > 256)
         return Results.BadRequest(new { error = "A senha precisa ter entre 11 e 256 caracteres." });
     if (input.Role is not ("admin" or "user")) return Results.BadRequest(new { error = "Escolha a função administrador ou usuário." });
+    if (string.Equals(username, "admin", StringComparison.OrdinalIgnoreCase) && input.Role != "admin")
+        return Results.BadRequest(new { error = "A conta admin padrão deve permanecer como administrador." });
     var user = new DssUser { Username = username, PasswordHash = AuthService.HashPassword(input.Password), Role = input.Role };
     var added = await state.UpdateAsync(data =>
     {
@@ -680,10 +699,14 @@ app.MapPut("/api/users/{id:guid}", async (Guid id, UserUpdateInput input, HttpCo
     if (input.Role is not ("admin" or "user")) return Results.BadRequest(new { error = "Escolha a função administrador ou usuário." });
     if (input.Password is { Length: > 0 } password && password.Length is < 11 or > 256)
         return Results.BadRequest(new { error = "A senha precisa ter entre 11 e 256 caracteres." });
+    var isDefaultAdmin = await state.ReadAsync(data => data.Users.Any(user => user.Id == id && string.Equals(user.Username, "admin", StringComparison.OrdinalIgnoreCase)));
+    if (isDefaultAdmin && input.Role != "admin")
+        return Results.Conflict(new { error = "A conta admin padrão deve permanecer como administrador." });
     var updated = await state.UpdateAsync(data =>
     {
         var user = data.Users.FirstOrDefault(item => item.Id == id);
         if (user is null) return false;
+        if (string.Equals(user.Username, "admin", StringComparison.OrdinalIgnoreCase) && input.Role != "admin") return false;
         if (user.Role == "admin" && input.Role != "admin" && data.Users.Count(item => item.Role == "admin") <= 1) return false;
         user.Role = input.Role;
         if (!string.IsNullOrEmpty(input.Password))
@@ -766,17 +789,19 @@ app.MapPut("/api/settings/steamcmd", async (SteamCmdDirectoryInput input, HttpCo
 app.MapPut("/api/settings/language", async (UiLanguageInput input, HttpContext context) =>
 {
     if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    if (auth.GetSessionUserId(context) is not { } userId) return Results.Unauthorized();
     var language = input.Language?.Trim();
     if (language is not ("pt-BR" or "en-US" or "es-ES" or "fr-FR" or "de-DE" or "ru-RU" or "zh-CN"))
         return Results.BadRequest(new { error = "Idioma não suportado." });
-    await state.UpdateAsync(data =>
+    var savedLanguage = await state.UpdateAsync(data =>
     {
-        if (!string.Equals(data.UiLanguage, language, StringComparison.Ordinal))
-            data.Revisions.Add(new ConfigRevision { Kind = "dss-settings", Target = "Idioma", Summary = $"Idioma do DSS alterado para {language}", CanRollback = false, IsGlobal = true });
-        data.UiLanguage = language;
-        return true;
+        var user = data.Users.FirstOrDefault(item => item.Id == userId);
+        if (user is null) return null;
+        user.UiLanguage = language;
+        return user.UiLanguage;
     });
-    return Results.Ok(new { language });
+    if (savedLanguage is null) return Results.Unauthorized();
+    return Results.Ok(new { language = savedLanguage });
 });
 
 app.MapGet("/api/dashboard", async (HttpContext context) =>
@@ -784,6 +809,11 @@ app.MapGet("/api/dashboard", async (HttpContext context) =>
     if (!RequireAuth(context, auth)) return Results.Unauthorized();
     var userId = auth.GetSessionUserId(context);
     var isAdmin = await state.ReadAsync(data => data.Users.Any(user => user.Id == userId && user.Role == "admin"));
+    var uiLanguage = await state.ReadAsync(data =>
+    {
+        var preference = data.Users.FirstOrDefault(user => user.Id == userId)?.UiLanguage;
+        return string.IsNullOrWhiteSpace(preference) ? "en-US" : preference;
+    });
     var profiles = await state.ReadAsync(data => data.Instances.Where(profile => isAdmin || profile.AllowedUserIds.Contains(userId ?? Guid.Empty)).Select(profile => ToView(profile, supervisor.GetStatus(profile.Id), gameAdapters, state.DataDirectory, steamCmd, supervisor)).ToArray());
     var visibleProfileIds = profiles.Select(profile => profile.Id).ToHashSet();
     var revisions = await state.ReadAsync(data => data.Revisions
@@ -800,7 +830,7 @@ app.MapGet("/api/dashboard", async (HttpContext context) =>
         recentChanges = revisions,
         dataDirectory = state.DataDirectory,
         logsDirectory = state.LogsDirectory,
-        uiLanguage = await state.ReadAsync(data => data.UiLanguage),
+        uiLanguage,
         listenMode,
         panelAccessUrls = GetPanelAccessUrls(listenMode, listenPort),
         clientAccess
@@ -811,6 +841,30 @@ app.MapGet("/api/host/metrics", (HttpContext context) =>
 {
     if (!RequireAuth(context, auth)) return Results.Unauthorized();
     return Results.Ok(hostMetrics.Snapshot);
+});
+
+app.MapGet("/api/network/local-addresses", (HttpContext context) =>
+{
+    if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    return Results.Ok(new { addresses = GetLocalIpv4Addresses() });
+});
+
+app.MapGet("/api/network/public-address", async (HttpContext context, IHttpClientFactory clients, CancellationToken cancellationToken) =>
+{
+    if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    try
+    {
+        using var response = await clients.CreateClient("public-ip").GetAsync("https://api.ipify.org", cancellationToken);
+        if (!response.IsSuccessStatusCode) return Results.Ok(new { address = (string?)null });
+        var value = (await response.Content.ReadAsStringAsync(cancellationToken)).Trim();
+        return IPAddress.TryParse(value, out var address)
+            ? Results.Ok(new { address = address.ToString() })
+            : Results.Ok(new { address = (string?)null });
+    }
+    catch (Exception error) when (error is HttpRequestException or OperationCanceledException)
+    {
+        return Results.Ok(new { address = (string?)null });
+    }
 });
 
 app.MapGet("/api/processes/metrics", async (HttpContext context) =>
@@ -847,10 +901,96 @@ app.MapGet("/api/instances/{id:guid}/performance", async (Guid id, Guid? serverI
     {
         running = supervisor.GetStatus(endpoint.Id) == "running",
         process = supervisor.GetProcessMetrics(endpoint.Id),
-        diskUsedBytes = supervisor.GetProfileStorageBytes(activeProfile),
+        savesBytes = supervisor.GetSaveDirectoryBytes(activeProfile),
         networkProtocol = adapter?.FirewallProtocol ?? "—",
         networkPortStart = activeProfile.Port,
         networkPortEnd = activeProfile.Port + Math.Max(0, (adapter?.PortSpan ?? 1) - 1)
+    });
+});
+
+app.MapGet("/api/instances/{id:guid}/network/connectivity", async (Guid id, Guid? serverId, HttpContext context,
+    IHttpClientFactory clients, CancellationToken cancellationToken) =>
+{
+    if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    var root = await state.ReadAsync(data => data.Instances.FirstOrDefault(item => item.Id == id));
+    var endpoint = root?.Servers.FirstOrDefault(server => server.Id == serverId) ??
+        root?.Servers.FirstOrDefault(server => server.Id == id) ?? root?.Servers.FirstOrDefault();
+    if (root is null || endpoint is null) return Results.NotFound();
+    var profile = root.WithServer(endpoint);
+    var localAddresses = GetLocalIpv4Addresses();
+    string? publicAddress = null;
+    try
+    {
+        using var response = await clients.CreateClient("public-ip").GetAsync("https://api.ipify.org", cancellationToken);
+        if (response.IsSuccessStatusCode)
+        {
+            var value = (await response.Content.ReadAsStringAsync(cancellationToken)).Trim();
+            if (IPAddress.TryParse(value, out var parsed) && parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
+                publicAddress = parsed.ToString();
+        }
+    }
+    catch (Exception error) when (error is HttpRequestException or OperationCanceledException) { }
+
+    var running = supervisor.GetStatus(endpoint.Id) == "running";
+    var queryPort = profile.Port + 1;
+    if (!running)
+    {
+        return Results.Ok(new
+        {
+            running,
+            crossplay = profile.Crossplay,
+            port = profile.Port,
+            queryPort,
+            localAddresses = localAddresses.Select(address => new { address, status = "offline", message = "Servidor parado." }).ToArray(),
+            publicAddress = publicAddress is null ? null : new { address = publicAddress, status = "offline", message = "Servidor parado." }
+        });
+    }
+
+    if (profile.Crossplay || !profile.GameId.Equals("valheim", StringComparison.OrdinalIgnoreCase) || queryPort is < 1 or > 65535)
+    {
+        var message = profile.Crossplay
+            ? "Crossplay usa relay; a conexão não pode ser confirmada por IP direto."
+            : "O servidor está ativo, mas o teste UDP de consulta não está disponível para este jogo.";
+        return Results.Ok(new
+        {
+            running,
+            crossplay = profile.Crossplay,
+            port = profile.Port,
+            queryPort,
+            localAddresses = localAddresses.Select(address => new { address, status = "restricted", message }).ToArray(),
+            publicAddress = publicAddress is null ? null : new { address = publicAddress, status = "restricted", message }
+        });
+    }
+
+    var loopbackTask = playerManagement.CanQueryServerAsync(IPAddress.Loopback, queryPort, cancellationToken);
+    var localChecksTask = Task.WhenAll(localAddresses.Select(address => playerManagement.CanQueryServerAsync(IPAddress.Parse(address), queryPort, cancellationToken)));
+    var publicCheckTask = publicAddress is null
+        ? Task.FromResult(false)
+        : playerManagement.CanQueryServerAsync(IPAddress.Parse(publicAddress), queryPort, cancellationToken);
+    await Task.WhenAll(loopbackTask, localChecksTask, publicCheckTask);
+    var loopbackResponded = await loopbackTask;
+    var localChecks = await localChecksTask;
+    var publicResponded = await publicCheckTask;
+
+    object BuildStatus(string address, bool responded, bool isPublic)
+    {
+        if (responded)
+            return new { address, status = "online", message = "O servidor respondeu à consulta UDP neste endereço." };
+        if (loopbackResponded)
+            return new { address, status = "restricted", message = isPublic
+                ? "O servidor responde localmente; o acesso público e o encaminhamento do roteador não foram confirmados."
+                : "O servidor responde localmente, mas não por este IP; confira o Firewall e as portas UDP." };
+        return new { address, status = "restricted", message = "O processo está ativo, mas a porta de consulta UDP não respondeu ao teste." };
+    }
+
+    return Results.Ok(new
+    {
+        running,
+        crossplay = false,
+        port = profile.Port,
+        queryPort,
+        localAddresses = localAddresses.Select((address, index) => BuildStatus(address.ToString(), localChecks[index], false)).ToArray(),
+        publicAddress = publicAddress is null ? null : BuildStatus(publicAddress, publicResponded, true)
     });
 });
 
@@ -1120,7 +1260,7 @@ app.MapDelete("/api/instances/{id:guid}", async (Guid id, bool? deleteServerFile
     if (deleteServerFiles == true && gameAdapters.TryGet(removal.Profile.GameId, out var removalAdapter) &&
         IsExecutableRunningFromDirectory(removal.Profile.InstallPath, removalAdapter.ExecutableName))
         return Results.Conflict(new { error = "Os arquivos não podem ser excluídos enquanto o servidor estiver aberto. Feche o processo do jogo e tente novamente." });
-    try { DeleteProfileFiles(removal.Profile, removal.Profiles, state.DataDirectory, deleteServerFiles == true, deleteSaves == true); }
+    try { DeleteProfileFiles(removal.Profile, removal.Profiles, state.DataDirectory, app.Environment.ContentRootPath, deleteServerFiles == true, deleteSaves == true); }
     catch (Exception error) when (error is IOException or UnauthorizedAccessException or InvalidOperationException or ArgumentException or NotSupportedException)
     {
         return Results.Conflict(new { error = error.Message });
@@ -1239,13 +1379,15 @@ app.MapPost("/api/instances/{id:guid}/game/update", async (Guid id, HttpContext 
     var installation = await steamCmd.BeginInstallAsync(id, startAfterInstall: false);
     if (installation.Started) await state.UpdateAsync(data => { data.Revisions.Add(new ConfigRevision { InstanceId = id, Kind = "profile-action", Target = "jogo", Summary = "Atualização do servidor solicitada", CanRollback = false }); return true; });
     return installation.Started
-        ? Results.Accepted($"/api/instances/{id}/game/update-status", new { message = installation.Message })
+        ? Results.Accepted($"/api/instances/{id}/game/update-status", new { message = installation.Message, operation = steamCmd.GetOperation(id) })
         : Results.Conflict(new { error = installation.Message });
 });
 
 app.MapGet("/api/instances/{id:guid}/game/update-status", (Guid id, HttpContext context, long after = 0) =>
 {
     if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    context.Response.Headers.CacheControl = "no-store, no-cache, must-revalidate";
+    context.Response.Headers.Pragma = "no-cache";
     return Results.Ok(new { operation = steamCmd.GetOperation(id, after) });
 });
 
@@ -1390,7 +1532,8 @@ app.MapGet("/api/instances/{id:guid}/players", async (Guid id, Guid? serverId, H
     {
         var saveDirectory = SavePathResolver.Resolve(profile, state.DataDirectory);
         var logPath = supervisor.GetConsoleLogPath(endpoint.Id) ?? state.GetServerLogPath(endpoint.Id);
-        var snapshot = await playerManagement.GetAsync(profile, saveDirectory, logPath,
+        var historyPath = state.GetPlayerHistoryPath(endpoint.Id);
+        var snapshot = await playerManagement.GetAsync(profile, saveDirectory, logPath, historyPath,
             supervisor.GetStatus(endpoint.Id) == "running", cancellationToken);
         return Results.Ok(snapshot);
     }
@@ -1426,7 +1569,8 @@ app.MapPost("/api/instances/{id:guid}/players/{action}", async (Guid id, string 
                 return Results.Conflict(new { error = "Para aplicar esta ação durante a execução, instale e ative DreamWraith-ConsoleStdinHeeler e reinicie o servidor." });
 
             var logPath = supervisor.GetConsoleLogPath(endpoint.Id) ?? state.GetServerLogPath(endpoint.Id);
-            var snapshot = await playerManagement.GetAsync(profile, saveDirectory, logPath, true, cancellationToken);
+            var historyPath = state.GetPlayerHistoryPath(endpoint.Id);
+            var snapshot = await playerManagement.GetAsync(profile, saveDirectory, logPath, historyPath, true, cancellationToken);
             var target = snapshot.Players.FirstOrDefault(player =>
                 string.Equals(player.UserId, playerId, StringComparison.Ordinal));
             if (action == "kick" && (target is null || !target.IsActive))
@@ -1447,7 +1591,7 @@ app.MapPost("/api/instances/{id:guid}/players/{action}", async (Guid id, string 
                 for (var attempt = 0; attempt < 10; attempt++)
                 {
                     await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
-                    var afterKick = await playerManagement.GetAsync(profile, saveDirectory, logPath, true, cancellationToken);
+                    var afterKick = await playerManagement.GetAsync(profile, saveDirectory, logPath, historyPath, true, cancellationToken);
                     if (afterKick.LivePlayerNames is { } liveNames)
                     {
                         if (!liveNames.Contains(target!.Name.Trim(), StringComparer.OrdinalIgnoreCase))
@@ -1819,15 +1963,14 @@ app.MapPost("/api/instances/{id:guid}/mods/install", async (Guid id, ModInstallI
     if (modOwnerId is null) return Results.NotFound();
     try
     {
+        var installProfile = await state.ReadAsync(data => data.Instances.FirstOrDefault(item => item.Id == modOwnerId.Value));
+        var previousMods = await state.ReadAsync(data => data.InstalledMods.Where(item => item.InstanceId == modOwnerId.Value).ToArray());
+        var previousFiles = previousMods.ToDictionary(item => item.Id, item => ExistingManagedFiles(installProfile, item));
         var installed = await modPackages.InstallAsync(modOwnerId.Value, input.Provider, input.PackageId, cancellationToken, input.DependencyVersions);
         await state.UpdateAsync(data =>
         {
             foreach (var mod in installed)
-                data.Revisions.Add(new ConfigRevision
-            {
-                InstanceId = id, Kind = "mod-package", Target = mod.PackageId,
-                Summary = $"Mod instalado/atualizado: {mod.Name} {mod.Version}", CanRollback = false
-            });
+                data.Revisions.Add(CreateModHistoryRevision(id, mod, FindPreviousMod(previousMods, mod), previousFiles, installProfile));
             return true;
         });
         var names = installed.Select(mod => $"{mod.Name} {mod.Version}").ToArray();
@@ -1853,6 +1996,9 @@ app.MapPost("/api/instances/{id:guid}/mods/install-batch", async (Guid id, ModIn
         return Results.BadRequest(new { error = "A seleção de mods é inválida. Escolha entre 1 e 200 pacotes." });
     var modOwnerId = await ResolveModOwnerIdAsync(id, state);
     if (modOwnerId is null) return Results.NotFound();
+    var installProfile = await state.ReadAsync(data => data.Instances.FirstOrDefault(item => item.Id == modOwnerId.Value));
+    var previousMods = await state.ReadAsync(data => data.InstalledMods.Where(item => item.InstanceId == modOwnerId.Value).ToArray());
+    var previousFiles = previousMods.ToDictionary(item => item.Id, item => ExistingManagedFiles(installProfile, item));
     var packageIds = input.PackageIds.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
     return Results.Stream(async stream =>
     {
@@ -1872,11 +2018,7 @@ app.MapPost("/api/instances/{id:guid}/mods/install-batch", async (Guid id, ModIn
                     await state.UpdateAsync(data =>
                     {
                         foreach (var mod in installed)
-                            data.Revisions.Add(new ConfigRevision
-                            {
-                                InstanceId = id, Kind = "mod-package", Target = mod.PackageId,
-                                Summary = $"Mod instalado/atualizado: {mod.Name} {mod.Version}", CanRollback = false
-                            });
+                            data.Revisions.Add(CreateModHistoryRevision(id, mod, FindPreviousMod(previousMods, mod), previousFiles, installProfile));
                         return true;
                     });
                 var names = installed.Select(mod => $"{mod.Name} {mod.Version}").ToArray();
@@ -1916,14 +2058,20 @@ app.MapPost("/api/instances/{id:guid}/mods/uninstall-batch", async (Guid id, Mod
     if (modOwnerId is null) return Results.NotFound();
     try
     {
+        var selectedIds = input.ModIds.Distinct().ToHashSet();
+        var installProfile = await state.ReadAsync(data => data.Instances.FirstOrDefault(item => item.Id == modOwnerId.Value));
+        var selectedMods = await state.ReadAsync(data => data.InstalledMods.Where(item => item.InstanceId == modOwnerId.Value && selectedIds.Contains(item.Id)).ToArray());
         var results = await modPackages.UninstallBatchAsync(modOwnerId.Value, input.ModIds.Distinct().ToArray(), cancellationToken);
         var removed = results.Where(result => result.Error is null).ToArray();
         if (removed.Length > 0)
             await state.UpdateAsync(data =>
             {
                 foreach (var result in removed)
-                    data.Revisions.Add(new ConfigRevision { InstanceId = id, Kind = "mod-package", Target = result.Name,
-                        Summary = $"Mod removido: {result.Name}", CanRollback = false });
+                {
+                    var mod = selectedMods.FirstOrDefault(item => item.Id == result.ModId);
+                    if (mod is not null)
+                        data.Revisions.Add(CreateModRemovalHistoryRevision(id, mod, result.RemovedFiles, result.PreservedFiles));
+                }
                 return true;
             });
         var removedFiles = removed.Sum(result => result.Removed);
@@ -1931,7 +2079,8 @@ app.MapPost("/api/instances/{id:guid}/mods/uninstall-batch", async (Guid id, Mod
         var message = removed.Length == results.Count
             ? $"{removed.Length} mods removidos em lote · {removedFiles} arquivo(s) excluído(s), {preservedFiles} alteração(ões) preservada(s)."
             : $"{removed.Length} de {results.Count} mods removidos · {removedFiles} arquivo(s) excluído(s). {string.Join("; ", results.Where(result => result.Error is not null).Select(result => $"{result.Name}: {result.Error}"))}";
-        return Results.Ok(new { removedModIds = removed.Select(result => result.ModId), failed = results.Where(result => result.Error is not null), message });
+        return Results.Ok(new { removedModIds = removed.Select(result => result.ModId), failed = results.Where(result => result.Error is not null),
+            removals = removed.Select(result => new { result.ModId, result.RemovedFiles, result.PreservedFiles }), message });
     }
     catch (ModInstallException ex) { return Results.Json(new { error = ex.Message }, statusCode: (int)ex.StatusCode); }
     catch (IOException) { return Results.Problem("Não foi possível remover os arquivos dos mods.", statusCode: StatusCodes.Status500InternalServerError); }
@@ -2150,7 +2299,7 @@ app.MapPost("/api/instances/{id:guid}/mods/check-updates", async (Guid id, HttpC
             continue;
         }
         IReadOnlyList<CatalogPackage> current;
-        try { current = await providers.RefreshAsync(group.Key, cancellationToken); }
+        try { current = await providers.FindPackagesOnlineAsync(group.Key, group.Select(mod => mod.PackageId).ToArray(), cancellationToken); }
         catch (ProviderException ex) { results.AddRange(group.Select(mod => (object)new { modId = mod.Id, hasUpdate = false, error = ex.Message })); continue; }
         catch (HttpRequestException) { results.AddRange(group.Select(mod => (object)new { modId = mod.Id, hasUpdate = false, error = "Não foi possível consultar o catálogo." })); continue; }
         catch (TaskCanceledException) { results.AddRange(group.Select(mod => (object)new { modId = mod.Id, hasUpdate = false, error = "A consulta ao provedor expirou." })); continue; }
@@ -2173,15 +2322,16 @@ app.MapDelete("/api/instances/{id:guid}/mods/{modId:guid}", async (Guid id, Guid
     if (modOwnerId is null) return Results.NotFound();
     try
     {
-        var modName = await state.ReadAsync(data => data.InstalledMods.FirstOrDefault(item => item.InstanceId == modOwnerId && item.Id == modId)?.Name);
+        var mod = await state.ReadAsync(data => data.InstalledMods.FirstOrDefault(item => item.InstanceId == modOwnerId && item.Id == modId));
+        if (mod is null) return Results.NotFound(new { error = "O pacote não está no inventário gerenciado." });
         var result = await modPackages.UninstallAsync(modOwnerId.Value, modId);
         await state.UpdateAsync(data =>
         {
-            var displayName = string.IsNullOrWhiteSpace(modName) ? "Mod" : modName;
-            data.Revisions.Add(new ConfigRevision { InstanceId = id, Kind = "mod-package", Target = displayName, Summary = $"Mod removido: {displayName}", CanRollback = false });
+            data.Revisions.Add(CreateModRemovalHistoryRevision(id, mod, result.RemovedFiles, result.PreservedFiles));
             return true;
         });
-        return Results.Ok(new { message = $"Pacote removido: {result.Removed} arquivo(s) excluído(s), {result.Preserved} arquivo(s) alterado(s) preservado(s)." });
+        return Results.Ok(new { message = $"Pacote removido: {result.Removed} arquivo(s) excluído(s), {result.Preserved} arquivo(s) alterado(s) preservado(s).",
+            removedFiles = result.RemovedFiles, preservedFiles = result.PreservedFiles });
     }
     catch (ModInstallException ex) { return Results.Json(new { error = ex.Message }, statusCode: (int)ex.StatusCode); }
 });
@@ -2199,6 +2349,74 @@ app.MapGet("/api/instances/{id:guid}/configs", async (Guid id, HttpContext conte
         .Select(path => Path.GetRelativePath(configRoot, path).Replace('\\', '/'))
         .Order(StringComparer.OrdinalIgnoreCase).ToArray();
     return Results.Ok(new { files });
+});
+
+app.MapPost("/api/instances/{id:guid}/configs/delete-batch", async (Guid id, ConfigBatchDeleteInput? input, HttpContext context) =>
+{
+    if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    if (await IsGroupRunningAsync(id, state, supervisor))
+        return Results.Conflict(new { error = "Pare todos os servidores do perfil antes de excluir arquivos BepInEx." });
+    if (input?.Paths is null || input.Paths.Length is < 1 or > 5000)
+        return Results.BadRequest(new { error = "Selecione entre 1 e 5.000 arquivos de configuração." });
+
+    var profile = await state.ReadAsync(data => data.Instances.FirstOrDefault(item => item.Id == id));
+    if (profile is null) return Results.NotFound();
+    var selected = new List<(string RelativePath, string? FullPath)>();
+    foreach (var value in input.Paths.Distinct(StringComparer.OrdinalIgnoreCase))
+    {
+        var relativePath = value ?? "";
+        string? fullPath = null;
+        try { if (!string.IsNullOrWhiteSpace(relativePath)) fullPath = SafeConfigPath(profile, relativePath); }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException) { }
+        selected.Add((relativePath, fullPath));
+    }
+    if (selected.Any(item => string.IsNullOrWhiteSpace(item.RelativePath) || item.FullPath is null || !IsEditableConfig(item.FullPath)))
+        return Results.BadRequest(new { error = "A lista contém um caminho de configuração inválido." });
+
+    var deleted = new List<string>();
+    var failed = new List<object>();
+    var revisions = new List<ConfigRevision>();
+    foreach (var item in selected)
+    {
+        var fullPath = item.FullPath!;
+        if (!File.Exists(fullPath))
+        {
+            failed.Add(new { path = item.RelativePath, message = "O arquivo não existe mais." });
+            continue;
+        }
+        try
+        {
+            var canRollback = new FileInfo(fullPath).Length <= 1_000_000;
+            var before = canRollback ? await File.ReadAllTextAsync(fullPath, context.RequestAborted) : "";
+            File.Delete(fullPath);
+            deleted.Add(item.RelativePath.Replace('\\', '/'));
+            revisions.Add(new ConfigRevision
+            {
+                InstanceId = id, Kind = "bepinex-file", Target = item.RelativePath.Replace('\\', '/'),
+                Summary = $"BepInEx config deleted: {Path.GetFileName(fullPath)}",
+                BeforeExists = true, BeforeJson = canRollback ? ProtectHistory(before) : "",
+                AfterJson = ProtectHistory(""), CanRollback = canRollback
+            });
+        }
+        catch (IOException)
+        {
+            failed.Add(new { path = item.RelativePath, message = "O arquivo está em uso ou não pôde ser excluído." });
+        }
+        catch (UnauthorizedAccessException)
+        {
+            failed.Add(new { path = item.RelativePath, message = "O Windows negou acesso ao arquivo." });
+        }
+    }
+    if (revisions.Count > 0)
+        await state.UpdateAsync(data => { data.Revisions.AddRange(revisions); return true; });
+    return Results.Ok(new
+    {
+        deleted,
+        failed,
+        message = failed.Count == 0
+            ? $"{deleted.Count} arquivo(s) de configuração excluído(s)."
+            : $"{deleted.Count} arquivo(s) excluído(s); {failed.Count} não puderam ser removidos."
+    });
 });
 
 app.MapGet("/api/instances/{id:guid}/configs/{**relativePath}", async (Guid id, string relativePath, HttpContext context) =>
@@ -2296,11 +2514,26 @@ app.MapGet("/api/history", async (HttpContext context, Guid? instanceId) =>
     return Results.Ok(new { revisions });
 });
 
+app.MapDelete("/api/history", async (HttpContext context) =>
+{
+    if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    if (!await RequireAdmin(context, auth, state)) return Results.Forbid();
+    var removedCount = await state.UpdateAsync(data =>
+    {
+        var count = data.Revisions.Count;
+        data.Revisions.Clear();
+        return count;
+    });
+    return Results.Ok(new { removedCount, message = $"Histórico limpo: {removedCount} registro(s) removido(s)." });
+});
+
 app.MapGet("/api/instances/{id:guid}/history", async (Guid id, HttpContext context) =>
 {
     if (!RequireAuth(context, auth)) return Results.Unauthorized();
-    var exists = await state.ReadAsync(data => data.Instances.Any(item => item.Id == id));
-    if (!exists) return Results.NotFound();
+    var userId = auth.GetSessionUserId(context);
+    var canAccess = await state.ReadAsync(data => data.Users.Any(user => user.Id == userId && user.Role == "admin") ||
+        data.Instances.Any(profile => profile.Id == id && profile.AllowedUserIds.Contains(userId ?? Guid.Empty)));
+    if (!canAccess) return Results.NotFound();
     var revisions = await state.ReadAsync(data => data.Revisions.Where(item => item.InstanceId == id && !item.IsGlobal)
         .OrderByDescending(item => item.CreatedAt).Take(500).Select(ToRevisionView).ToArray());
     var logModToggleActions = await state.ReadAsync(data => data.Instances.First(item => item.Id == id).LogModToggleActions);
@@ -2324,6 +2557,10 @@ app.MapPut("/api/instances/{id:guid}/history/settings", async (Guid id, ProfileH
 app.MapGet("/api/instances/{id:guid}/history/{revisionId:guid}", async (Guid id, Guid revisionId, HttpContext context) =>
 {
     if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    var userId = auth.GetSessionUserId(context);
+    var canAccess = await state.ReadAsync(data => data.Users.Any(user => user.Id == userId && user.Role == "admin") ||
+        data.Instances.Any(profile => profile.Id == id && profile.AllowedUserIds.Contains(userId ?? Guid.Empty)));
+    if (!canAccess) return Results.NotFound();
     var revision = await state.ReadAsync(data => data.Revisions.FirstOrDefault(item =>
         item.Id == revisionId && item.InstanceId == id && !item.IsGlobal));
     return revision is null ? Results.NotFound() : Results.Ok(ToRevisionDetail(revision));
@@ -2604,12 +2841,43 @@ app.MapGet("/api/catalog/count", async (string provider, string? q, string? fiel
     catch (JsonException) { return Results.Json(new { error = "O provedor retornou um catálogo em formato inesperado; a resposta não foi usada." }, statusCode: StatusCodes.Status502BadGateway); }
 });
 
+app.MapGet("/api/catalog/details/{provider}", async (string provider, string? ids, HttpContext context, CancellationToken cancellationToken) =>
+{
+    if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    var packageIds = (ids ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .Distinct(StringComparer.OrdinalIgnoreCase).Take(24).ToArray();
+    if (packageIds.Length == 0) return Results.BadRequest(new { error = "Informe ao menos um identificador de mod." });
+    try
+    {
+        var items = await providers.FindPackagesOnlineAsync(provider, packageIds, cancellationToken);
+        return Results.Ok(new { items });
+    }
+    catch (ProviderException ex) { return Results.Json(new { error = ex.Message }, statusCode: StatusCodes.Status503ServiceUnavailable); }
+    catch (HttpRequestException) { return Results.Json(new { error = "Não foi possível consultar o provedor dos mods agora." }, statusCode: StatusCodes.Status502BadGateway); }
+    catch (TaskCanceledException) { return Results.Json(new { error = "A consulta ao provedor expirou." }, statusCode: StatusCodes.Status504GatewayTimeout); }
+    catch (JsonException) { return Results.Json(new { error = "O provedor retornou dados em formato inesperado." }, statusCode: StatusCodes.Status502BadGateway); }
+});
+
+app.MapGet("/api/catalog/{provider}/{packageId}", async (string provider, string packageId, HttpContext context, CancellationToken cancellationToken) =>
+{
+    if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    try
+    {
+        var package = await providers.FindPackageOnlineAsync(provider, packageId, cancellationToken);
+        return package is null ? Results.NotFound(new { error = "Este mod não foi encontrado no provedor." }) : Results.Ok(package);
+    }
+    catch (ProviderException ex) { return Results.Json(new { error = ex.Message }, statusCode: StatusCodes.Status503ServiceUnavailable); }
+    catch (HttpRequestException) { return Results.Json(new { error = "Não foi possível consultar o provedor do mod agora." }, statusCode: StatusCodes.Status502BadGateway); }
+    catch (TaskCanceledException) { return Results.Json(new { error = "A consulta ao provedor expirou." }, statusCode: StatusCodes.Status504GatewayTimeout); }
+    catch (JsonException) { return Results.Json(new { error = "O provedor retornou dados em formato inesperado." }, statusCode: StatusCodes.Status502BadGateway); }
+});
+
 app.MapGet("/api/catalog/{provider}/{packageId}/versions", async (string provider, string packageId, HttpContext context, CancellationToken cancellationToken) =>
 {
     if (!RequireAuth(context, auth)) return Results.Unauthorized();
     try
     {
-        var package = await providers.FindPackageAsync(provider, packageId, cancellationToken, includeDownloadLink: false);
+        var package = await providers.FindPackageOnlineAsync(provider, packageId, cancellationToken);
         if (package is null) return Results.NotFound(new { error = "Pacote não encontrado no catálogo atual." });
         var versions = (package.Versions ?? []).OrderByDescending(item => item.Version, StringComparer.OrdinalIgnoreCase).ToArray();
         var availableVersions = versions.Select(item => (object)new { version = item.Version, downloads = item.Downloads, createdAt = item.CreatedAt }).ToArray();
@@ -2917,7 +3185,7 @@ static string? GetUserImageUrl(string dataDirectory, Guid id)
     return File.Exists(imagePath) ? $"/api/users/{id}/image?v={File.GetLastWriteTimeUtc(imagePath).Ticks}" : null;
 }
 
-static void DeleteProfileFiles(ServerProfile profile, IReadOnlyList<ServerProfile> profiles, string dataDirectory, bool deleteServerFiles, bool deleteSaves)
+static void DeleteProfileFiles(ServerProfile profile, IReadOnlyList<ServerProfile> profiles, string dataDirectory, string applicationRoot, bool deleteServerFiles, bool deleteSaves)
 {
     if (!deleteServerFiles && !deleteSaves) return;
     var endpoints = profile.Servers.Count > 0 ? profile.Servers.Select(profile.WithServer).ToArray() : [profile];
@@ -2932,7 +3200,7 @@ static void DeleteProfileFiles(ServerProfile profile, IReadOnlyList<ServerProfil
         if (string.IsNullOrWhiteSpace(profile.InstallPath) || !Path.IsPathFullyQualified(profile.InstallPath))
             throw new InvalidOperationException("A pasta do servidor não é válida; os arquivos do jogo não foram excluídos.");
         installationPath = NormalizeDeletionPath(profile.InstallPath);
-        EnsureSafeDeletionPath(installationPath, dataDirectory);
+        EnsureSafeDeletionPath(installationPath, dataDirectory, applicationRoot);
         if (Directory.Exists(installationPath)) EnsureNoReparsePoints(installationPath);
         if (otherEndpoints.Any(endpoint => !string.IsNullOrWhiteSpace(endpoint.InstallPath) && Path.IsPathFullyQualified(endpoint.InstallPath) &&
             PathsOverlap(installationPath, NormalizeDeletionPath(endpoint.InstallPath))))
@@ -2947,12 +3215,12 @@ static void DeleteProfileFiles(ServerProfile profile, IReadOnlyList<ServerProfil
         {
             var defaultManagedPath = NormalizeDeletionPath(Path.Combine(dataDirectory, "instances", save.Endpoint.Id.ToString("N"), "worlds"));
             var isDefaultManagedSave = !save.Endpoint.UseInstallPathSaves && string.IsNullOrWhiteSpace(save.Endpoint.SaveDirectory) && SamePath(save.Path, defaultManagedPath);
-            EnsureSafeDeletionPath(save.Path, dataDirectory, allowDssManagedSave: isDefaultManagedSave);
+            EnsureSafeDeletionPath(save.Path, dataDirectory, applicationRoot, allowDssManagedSave: isDefaultManagedSave);
             if (Directory.Exists(save.Path)) EnsureNoReparsePoints(save.Path);
             if (otherEndpoints.Any(endpoint => PathsOverlap(save.Path, NormalizeDeletionPath(SavePathResolver.Resolve(endpoint, dataDirectory)))))
                 throw new InvalidOperationException($"A pasta de saves '{save.Path}' também é usada por outro perfil e não será excluída.");
         }
-        foreach (var save in saves) DeleteDirectorySafely(save.Path, dataDirectory, allowDssManagedSave: !save.Endpoint.UseInstallPathSaves && string.IsNullOrWhiteSpace(save.Endpoint.SaveDirectory));
+        foreach (var save in saves) DeleteDirectorySafely(save.Path, dataDirectory, applicationRoot, allowDssManagedSave: !save.Endpoint.UseInstallPathSaves && string.IsNullOrWhiteSpace(save.Endpoint.SaveDirectory));
     }
 
     if (installationPath is not null)
@@ -2960,7 +3228,7 @@ static void DeleteProfileFiles(ServerProfile profile, IReadOnlyList<ServerProfil
         var preservedSaves = deleteSaves ? [] : saves.Select(item => item.Path).Where(path => IsSameOrWithinPath(path, installationPath)).ToArray();
         if (preservedSaves.Any(path => SamePath(path, installationPath)))
             throw new InvalidOperationException("Os saves ocupam a pasta do servidor inteira; não é possível preservar os saves e excluir o restante dessa pasta.");
-        DeleteDirectoryPreserving(installationPath, preservedSaves, dataDirectory);
+        DeleteDirectoryPreserving(installationPath, preservedSaves, dataDirectory, applicationRoot);
     }
 }
 
@@ -2980,7 +3248,7 @@ static bool IsSameOrWithinPath(string path, string parent)
 
 static bool PathsOverlap(string left, string right) => IsSameOrWithinPath(left, right) || IsSameOrWithinPath(right, left);
 
-static void EnsureSafeDeletionPath(string path, string dataDirectory, bool allowDssManagedSave = false)
+static void EnsureSafeDeletionPath(string path, string dataDirectory, string applicationRoot, bool allowDssManagedSave = false)
 {
     var normalized = NormalizeDeletionPath(path);
     var root = Path.GetPathRoot(normalized)?.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
@@ -2989,24 +3257,24 @@ static void EnsureSafeDeletionPath(string path, string dataDirectory, bool allow
     var applicationData = NormalizeDeletionPath(dataDirectory);
     if (PathsOverlap(normalized, applicationData) && !allowDssManagedSave)
         throw new InvalidOperationException("O DSS bloqueou a exclusão para proteger os dados e as configurações do próprio painel.");
-    var protectedRoots = new[] { AppContext.BaseDirectory, Environment.GetFolderPath(Environment.SpecialFolder.Windows), Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles) }
+    var protectedRoots = new[] { applicationRoot, AppContext.BaseDirectory, Environment.GetFolderPath(Environment.SpecialFolder.Windows), Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles) }
         .Where(value => !string.IsNullOrWhiteSpace(value)).Select(NormalizeDeletionPath);
     if (protectedRoots.Any(protectedPath => PathsOverlap(normalized, protectedPath)))
         throw new InvalidOperationException("O DSS bloqueou a exclusão porque o caminho inclui arquivos do sistema ou do próprio aplicativo.");
     if (File.Exists(normalized)) throw new InvalidOperationException("O caminho de exclusão aponta para um arquivo, não para uma pasta.");
 }
 
-static void DeleteDirectorySafely(string path, string dataDirectory, bool allowDssManagedSave = false)
+static void DeleteDirectorySafely(string path, string dataDirectory, string applicationRoot, bool allowDssManagedSave = false)
 {
-    EnsureSafeDeletionPath(path, dataDirectory, allowDssManagedSave);
+    EnsureSafeDeletionPath(path, dataDirectory, applicationRoot, allowDssManagedSave);
     if (!Directory.Exists(path)) return;
     EnsureNoReparsePoints(path);
     Directory.Delete(path, recursive: true);
 }
 
-static void DeleteDirectoryPreserving(string path, IReadOnlyList<string> preservedPaths, string dataDirectory)
+static void DeleteDirectoryPreserving(string path, IReadOnlyList<string> preservedPaths, string dataDirectory, string applicationRoot)
 {
-    EnsureSafeDeletionPath(path, dataDirectory);
+    EnsureSafeDeletionPath(path, dataDirectory, applicationRoot);
     if (!Directory.Exists(path)) return;
     EnsureNoReparsePoints(path);
     DeleteDirectoryContents(path, preservedPaths);
@@ -3164,7 +3432,18 @@ static RevisionDetailView ToRevisionDetail(ConfigRevision revision)
 
     return new RevisionDetailView(revision.Id, revision.InstanceId, revision.CreatedAt, revision.Kind,
         revision.Target, revision.Summary, before, after, hasSnapshot, revision.CanRollback,
-        RevisionActorName(revision), RevisionActorImageUrl(revision));
+        RevisionActorName(revision), RevisionActorImageUrl(revision))
+    {
+        ModProvider = revision.ModProvider,
+        ModPackageId = revision.ModPackageId,
+        ModName = revision.ModName,
+        ModVersion = revision.ModVersion,
+        ModIconUrl = revision.ModIconUrl,
+        ModProjectUrl = revision.ModProjectUrl,
+        FilesInstalled = revision.FilesInstalled ?? [],
+        FilesRemoved = revision.FilesRemoved ?? [],
+        FilesPreserved = revision.FilesPreserved ?? []
+    };
 }
 
 static string FormatProfileSnapshot(string json)
@@ -3286,7 +3565,108 @@ static List<ConfigLineHunk> ComputeLineChangeHunks(string[] before, string[] aft
 
 static RevisionView ToRevisionView(ConfigRevision revision) => new(
     revision.Id, revision.InstanceId, revision.CreatedAt, revision.Kind, revision.Target,
-    revision.Summary, revision.CanRollback, RevisionActorName(revision), RevisionActorImageUrl(revision));
+    revision.Summary, revision.CanRollback, RevisionActorName(revision), RevisionActorImageUrl(revision))
+{
+    ModProvider = revision.ModProvider,
+    ModPackageId = revision.ModPackageId,
+    ModName = revision.ModName,
+    ModVersion = revision.ModVersion,
+    ModIconUrl = revision.ModIconUrl,
+    ModProjectUrl = revision.ModProjectUrl,
+    FilesInstalled = revision.FilesInstalled ?? [],
+    FilesRemoved = revision.FilesRemoved ?? [],
+    FilesPreserved = revision.FilesPreserved ?? []
+};
+
+static ConfigRevision CreateModHistoryRevision(Guid instanceId, InstalledMod installed,
+    InstalledMod? previous, IReadOnlyDictionary<Guid, HashSet<string>> previousFiles, ServerProfile? profile)
+{
+    var removedFiles = new List<string>();
+    var preservedFiles = new List<string>();
+    if (previous is not null && previousFiles.TryGetValue(previous.Id, out var existingBefore))
+    {
+        var newFiles = (installed.ManagedFiles ?? []).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var oldFile in (previous.ManagedFiles ?? []).Where(path => !newFiles.Contains(path) && existingBefore.Contains(path)))
+        {
+            if (ManagedFileExists(profile, oldFile)) preservedFiles.Add(oldFile.Replace('\\', '/'));
+            else removedFiles.Add(oldFile.Replace('\\', '/'));
+        }
+    }
+    var updated = previous is not null;
+    return new ConfigRevision
+    {
+        InstanceId = instanceId,
+        Kind = "mod-package",
+        Target = installed.Name,
+        Summary = $"Mod {(updated ? "atualizado" : "instalado")}: {installed.Name} {installed.Version}",
+        CanRollback = false,
+        ModProvider = NormalizeModHistoryProvider(installed.SourceProvider, installed.Provider),
+        ModPackageId = installed.PackageId,
+        ModName = installed.Name,
+        ModVersion = installed.Version,
+        ModIconUrl = installed.IconUrl,
+        ModProjectUrl = installed.ProjectUrl,
+        FilesInstalled = (installed.ManagedFiles ?? []).Select(path => path.Replace('\\', '/')).ToList(),
+        FilesRemoved = removedFiles,
+        FilesPreserved = preservedFiles
+    };
+}
+
+static ConfigRevision CreateModRemovalHistoryRevision(Guid instanceId, InstalledMod mod,
+    IReadOnlyList<string> removedFiles, IReadOnlyList<string> preservedFiles) => new()
+{
+    InstanceId = instanceId,
+    Kind = "mod-package",
+    Target = mod.Name,
+    Summary = $"Mod removido: {mod.Name}",
+    CanRollback = false,
+    ModProvider = NormalizeModHistoryProvider(mod.SourceProvider, mod.Provider),
+    ModPackageId = mod.PackageId,
+    ModName = mod.Name,
+    ModVersion = mod.Version,
+    ModIconUrl = mod.IconUrl,
+    ModProjectUrl = mod.ProjectUrl,
+    FilesRemoved = removedFiles.ToList(),
+    FilesPreserved = preservedFiles.ToList()
+};
+
+static InstalledMod? FindPreviousMod(IReadOnlyList<InstalledMod> previousMods, InstalledMod current)
+{
+    var source = NormalizeModHistoryProvider(current.SourceProvider, current.Provider);
+    return previousMods.FirstOrDefault(item => item.PackageId.Equals(current.PackageId, StringComparison.OrdinalIgnoreCase) &&
+        NormalizeModHistoryProvider(item.SourceProvider, item.Provider).Equals(source, StringComparison.OrdinalIgnoreCase));
+}
+
+static string NormalizeModHistoryProvider(string? sourceProvider, string? fallbackProvider)
+{
+    var provider = string.IsNullOrWhiteSpace(sourceProvider) ? fallbackProvider ?? "" : sourceProvider;
+    return provider.Equals("bepinex", StringComparison.OrdinalIgnoreCase) ? "thunderstore" : provider.Trim().ToLowerInvariant();
+}
+
+static HashSet<string> ExistingManagedFiles(ServerProfile? profile, InstalledMod mod)
+{
+    var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    foreach (var relative in mod.ManagedFiles ?? [])
+        if (ManagedFileExists(profile, relative)) existing.Add(relative);
+    return existing;
+}
+
+static bool ManagedFileExists(ServerProfile? profile, string relative)
+{
+    if (profile is null || string.IsNullOrWhiteSpace(profile.InstallPath) || !Path.IsPathFullyQualified(profile.InstallPath) ||
+        string.IsNullOrWhiteSpace(relative) || Path.IsPathRooted(relative)) return false;
+    try
+    {
+        var root = Path.GetFullPath(profile.InstallPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var candidate = Path.GetFullPath(Path.Combine(root, relative.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar)));
+        if (!candidate.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)) return false;
+        return File.Exists(candidate) || File.Exists(candidate + ".dss-disabled");
+    }
+    catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException or NotSupportedException)
+    {
+        return false;
+    }
+}
 
 static string RevisionActorName(ConfigRevision revision) => revision.ActorName ?? "Autor não registrado";
 
@@ -3342,6 +3722,33 @@ static string[] GetPanelAccessUrls(string mode, int port)
     catch (NetworkInformationException) { return []; }
 }
 
+static string[] GetLocalIpv4Addresses()
+{
+    try
+    {
+        return NetworkInterface.GetAllNetworkInterfaces()
+            .Where(adapter => adapter.OperationalStatus == OperationalStatus.Up && adapter.NetworkInterfaceType is not NetworkInterfaceType.Loopback and not NetworkInterfaceType.Tunnel)
+            .SelectMany(adapter => adapter.GetIPProperties().UnicastAddresses)
+            .Select(address => address.Address)
+            .Where(address => address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork &&
+                !IPAddress.IsLoopback(address) &&
+                !address.GetAddressBytes().Take(2).SequenceEqual(new byte[] { 169, 254 }) &&
+                IsPrivateIpv4(address))
+            .Distinct()
+            .OrderBy(address => IsPrivateIpv4(address) ? 0 : 1)
+            .ThenBy(address => address.ToString(), StringComparer.OrdinalIgnoreCase)
+            .Select(address => address.ToString())
+            .ToArray();
+    }
+    catch (NetworkInformationException) { return []; }
+}
+
+static bool IsPrivateIpv4(IPAddress address)
+{
+    var bytes = address.GetAddressBytes();
+    return bytes[0] == 10 || (bytes[0] == 172 && bytes[1] is >= 16 and <= 31) || (bytes[0] == 192 && bytes[1] == 168);
+}
+
 static object GetClientAccessInfo(HttpContext context)
 {
     var remoteAddress = context.Connection.RemoteIpAddress;
@@ -3383,6 +3790,7 @@ public sealed record AuthRequest(string Password, string Username = "admin");
 public sealed record ListenModeInput(string ListenMode, bool AcknowledgePublicRisk = false);
 public sealed record PanelFirewallInput(bool Enabled);
 public sealed record ConfigInput(string Content);
+public sealed record ConfigBatchDeleteInput(string[] Paths);
 public sealed record NexusDownloadAuthorizationInput(string Link);
 public sealed record ProfileImportDocument(
     int SchemaVersion,

@@ -12,6 +12,8 @@ export default defineConfig({
     outDir: resolve(import.meta.dirname, '../wwwroot'),
     emptyOutDir: true,
     sourcemap: false,
+    // Vite reports minified, uncompressed bytes; the current main bundle is 148 KB over gzip.
+    chunkSizeWarningLimit: 520,
     assetsInlineLimit: 4096,
     rollupOptions: {
       output: {

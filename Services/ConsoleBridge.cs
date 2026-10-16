@@ -74,17 +74,24 @@ public sealed class ConsoleBridgeManagedProcess : IManagedServerProcess
 
     public static async Task<ConsoleBridgeManagedProcess?> TryRecoverAsync(string pipeName, ConsoleBridgeStatus status)
     {
-        if (!IsBridgeAlive(status.BridgeProcessId)) return null;
-        try
+        var retryUntil = DateTimeOffset.UtcNow + TimeSpan.FromSeconds(10);
+        while (DateTimeOffset.UtcNow < retryUntil)
         {
-            var response = await SendRequestAsync(pipeName, new ConsoleBridgeRequest("status"), TimeSpan.FromMilliseconds(700));
-            if (response is not { Success: true, ProcessId: > 0 } || response.ProcessId != status.ServerProcessId) return null;
-            return new ConsoleBridgeManagedProcess(pipeName, status.BridgeProcessId, System.Diagnostics.Process.GetProcessById(response.ProcessId));
+            if (!IsBridgeAlive(status.BridgeProcessId)) return null;
+            try
+            {
+                var response = await SendRequestAsync(pipeName, new ConsoleBridgeRequest("status"), TimeSpan.FromMilliseconds(700));
+                if (response is { Success: true, ProcessId: > 0 } && response.ProcessId == status.ServerProcessId)
+                    return new ConsoleBridgeManagedProcess(pipeName, status.BridgeProcessId, System.Diagnostics.Process.GetProcessById(response.ProcessId));
+            }
+            catch (Exception ex) when (ex is ArgumentException or IOException or InvalidOperationException or TimeoutException or OperationCanceledException or System.ComponentModel.Win32Exception)
+            {
+                // Give an existing in-flight client time to disconnect and the bridge time
+                // to publish its next pipe instance before falling back to legacy recovery.
+            }
+            await Task.Delay(150);
         }
-        catch (Exception ex) when (ex is IOException or InvalidOperationException or TimeoutException or OperationCanceledException or System.ComponentModel.Win32Exception)
-        {
-            return null;
-        }
+        return null;
     }
 
     public async Task SendCommandAsync(string command)
@@ -156,26 +163,42 @@ public static class ConsoleBridgeHost
                 var connectTask = pipe.WaitForConnectionAsync();
                 if (await Task.WhenAny(connectTask, exitTask) == exitTask) break;
                 await connectTask;
-                using var reader = new StreamReader(pipe, new UTF8Encoding(false), leaveOpen: true);
-                await using var writer = new StreamWriter(pipe, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
-                var requestLine = await reader.ReadLineAsync();
-                ConsoleBridgeResponse response;
                 try
                 {
-                    var request = JsonSerializer.Deserialize<ConsoleBridgeRequest>(requestLine ?? "", JsonOptions);
-                    response = request?.Type switch
+                    using var reader = new StreamReader(pipe, new UTF8Encoding(false), leaveOpen: true);
+                    await using var writer = new StreamWriter(pipe, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
+                    var requestLine = await reader.ReadLineAsync();
+                    if (string.IsNullOrWhiteSpace(requestLine))
+                        continue;
+
+                    ConsoleBridgeResponse response;
+                    try
                     {
-                        "status" => new ConsoleBridgeResponse(!process.HasExited, process.HasExited ? "Server is no longer running." : "Console reconnected.", process.Process.Id),
-                        "command" when !string.IsNullOrWhiteSpace(request.Command) => await SendCommandAsync(process, request.Command),
-                        "ctrl-break" => await SendCtrlBreakAsync(process, request.TimeoutSeconds),
-                        _ => new ConsoleBridgeResponse(false, "Unsupported console bridge request.", process.Process.Id)
-                    };
+                        var request = JsonSerializer.Deserialize<ConsoleBridgeRequest>(requestLine, JsonOptions);
+                        response = request?.Type switch
+                        {
+                            "status" => new ConsoleBridgeResponse(!process.HasExited, process.HasExited ? "Server is no longer running." : "Console reconnected.", process.Process.Id),
+                            "command" when !string.IsNullOrWhiteSpace(request.Command) => await SendCommandAsync(process, request.Command),
+                            "ctrl-break" => await SendCtrlBreakAsync(process, request.TimeoutSeconds),
+                            _ => new ConsoleBridgeResponse(false, "Unsupported console bridge request.", process.Process.Id)
+                        };
+                    }
+                    catch (Exception ex) when (ex is JsonException or IOException or InvalidOperationException or ObjectDisposedException)
+                    {
+                        response = new ConsoleBridgeResponse(false, ex.Message, process.Process.Id);
+                    }
+
+                    try { await writer.WriteLineAsync(JsonSerializer.Serialize(response, JsonOptions)); }
+                    catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+                    {
+                        // The panel can disconnect while restarting; keep the game process
+                        // alive and reopen the named pipe for the replacement DSS process.
+                    }
                 }
-                catch (Exception ex) when (ex is JsonException or IOException or InvalidOperationException or ObjectDisposedException)
+                catch (Exception ex) when (ex is IOException or ObjectDisposedException)
                 {
-                    response = new ConsoleBridgeResponse(false, ex.Message, process.Process.Id);
+                    // A broken client pipe is a normal part of a panel restart.
                 }
-                await writer.WriteLineAsync(JsonSerializer.Serialize(response, JsonOptions));
             }
             await exitTask;
             AppendLog(config.LogPath, $"Server process exited with code {process.Process.ExitCode}.");

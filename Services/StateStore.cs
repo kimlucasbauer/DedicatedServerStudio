@@ -7,23 +7,31 @@ public sealed class StateStore
 {
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
     private static readonly AsyncLocal<Guid?> RevisionActor = new();
+    private const int MaxHistoryEntriesPerProfile = 500;
+    private const int MaxGlobalHistoryEntries = 500;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly string _filePath;
     private AppData _data;
 
     public string DataDirectory { get; }
     public string LogsDirectory { get; }
+    public string ContentRootPath { get; }
 
     public StateStore(IWebHostEnvironment environment)
     {
+        ContentRootPath = Path.GetFullPath(environment.ContentRootPath);
         DataDirectory = ResolveDataDirectory();
-        LogsDirectory = Path.Combine(environment.ContentRootPath, "logs");
+        LogsDirectory = Path.Combine(ContentRootPath, "logs");
         Directory.CreateDirectory(DataDirectory);
         Directory.CreateDirectory(LogsDirectory);
         _filePath = Path.Combine(DataDirectory, "studio-state.json");
         if (File.Exists(_filePath))
         {
-            try { _data = JsonSerializer.Deserialize<AppData>(File.ReadAllText(_filePath), JsonOptions) ?? new AppData(); }
+            try
+            {
+                using var stream = new FileStream(_filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 64 * 1024, FileOptions.SequentialScan);
+                _data = JsonSerializer.Deserialize<AppData>(stream, JsonOptions) ?? new AppData();
+            }
             catch (JsonException ex) { throw new InvalidDataException($"State file is invalid: {_filePath}", ex); }
 
             _data.Users ??= [];
@@ -33,6 +41,12 @@ public sealed class StateStore
             var now = DateTimeOffset.UtcNow;
             foreach (var user in _data.Users)
             {
+                if (string.Equals(user.Username, "admin", StringComparison.OrdinalIgnoreCase) && user.Role != "admin")
+                {
+                    user.Role = "admin";
+                    _data.AdminPasswordHash = user.PasswordHash;
+                    migrated = true;
+                }
                 if (user.LoginLocked)
                 {
                     if (user.LoginLockedUntil is not null) { user.LoginLockedUntil = null; migrated = true; }
@@ -187,6 +201,7 @@ public sealed class StateStore
                 _data.Users.Add(new DssUser { Username = "admin", PasswordHash = _data.AdminPasswordHash, Role = "admin" });
                 migrated = true;
             }
+            if (PruneHistory()) migrated = true;
             if (migrated) SaveUnsafe();
         }
         else
@@ -207,6 +222,41 @@ public sealed class StateStore
             try { File.Copy(legacyPath, path); }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
+        }
+        return path;
+    }
+
+    public string GetPlayerHistoryPath(Guid id)
+    {
+        // Keep recognized player history with DSS data rather than the install folder.
+        // This survives replacing or moving the application directory while leaving
+        // the user-requested application logs under the project root.
+        var directory = Path.Combine(DataDirectory, "servers", id.ToString("N"));
+        var path = Path.Combine(directory, "players.json");
+        if (File.Exists(path)) return path;
+
+        var legacyPaths = new[]
+        {
+            Path.Combine(LogsDirectory, "servers", id.ToString("N"), "players.json"),
+            Path.Combine(DataDirectory, "instances", id.ToString("N"), "players.json")
+        };
+        foreach (var legacyPath in legacyPaths)
+        {
+            if (!File.Exists(legacyPath)) continue;
+            try
+            {
+                Directory.CreateDirectory(directory);
+                File.Copy(legacyPath, path, overwrite: false);
+                break;
+            }
+            catch (IOException)
+            {
+                if (File.Exists(path)) break;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                break;
+            }
         }
         return path;
     }
@@ -252,6 +302,7 @@ public sealed class StateStore
             if (save)
             {
                 StampNewRevisions(originalRevisionCount);
+                PruneHistory();
                 await SaveUnsafeAsync();
             }
             return result;
@@ -275,18 +326,46 @@ public sealed class StateStore
         }
     }
 
+    private bool PruneHistory()
+    {
+        if (_data.Revisions.Count <= MaxHistoryEntriesPerProfile) return false;
+        static bool IsGlobal(ConfigRevision revision) => revision.IsGlobal || revision.InstanceId == Guid.Empty ||
+            revision.Kind.Equals("server-profile", StringComparison.OrdinalIgnoreCase) &&
+            revision.Summary is "Instância criada" or "Perfil criado" or "Perfil importado de JSON";
+
+        var retained = _data.Revisions.Where(IsGlobal)
+            .OrderByDescending(revision => revision.CreatedAt).Take(MaxGlobalHistoryEntries)
+            .Concat(_data.Revisions.Where(revision => !IsGlobal(revision))
+                .GroupBy(revision => revision.InstanceId)
+                .SelectMany(group => group.OrderByDescending(revision => revision.CreatedAt).Take(MaxHistoryEntriesPerProfile)))
+            .OrderBy(revision => revision.CreatedAt)
+            .ToList();
+        if (retained.Count == _data.Revisions.Count) return false;
+        _data.Revisions = retained;
+        return true;
+    }
+
     private sealed class RestoreRevisionActor(Action restore) : IDisposable
     {
         private Action? _restore = restore;
         public void Dispose() => Interlocked.Exchange(ref _restore, null)?.Invoke();
     }
 
-    private void SaveUnsafe() => File.WriteAllText(_filePath, JsonSerializer.Serialize(_data, JsonOptions));
+    private void SaveUnsafe()
+    {
+        using var stream = new FileStream(_filePath, FileMode.Create, FileAccess.Write, FileShare.Read, 64 * 1024, FileOptions.SequentialScan);
+        JsonSerializer.Serialize(stream, _data, JsonOptions);
+    }
 
     private async Task SaveUnsafeAsync()
     {
         var tempPath = _filePath + ".tmp";
-        await File.WriteAllTextAsync(tempPath, JsonSerializer.Serialize(_data, JsonOptions));
+        await using (var stream = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None,
+            64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+        {
+            await JsonSerializer.SerializeAsync(stream, _data, JsonOptions);
+            await stream.FlushAsync();
+        }
         File.Move(tempPath, _filePath, overwrite: true);
     }
 }

@@ -17,6 +17,8 @@ public sealed class SteamCmdService(
     ILogger<SteamCmdService> logger) : BackgroundService
 {
     private const int MaxOperationOutputLines = 1000;
+    private const int MaxCapturedOutputChars = 2 * 1024 * 1024;
+    private const int MaxSteamCmdLineChars = 16 * 1024;
     private const string SteamCmdDownloadUrl = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip";
     private static readonly TimeSpan BuildCacheDuration = TimeSpan.FromHours(6);
     private static readonly TimeSpan SteamCmdBootstrapRetryDelay = TimeSpan.FromSeconds(1);
@@ -64,7 +66,7 @@ public sealed class SteamCmdService(
 
         try
         {
-            var output = File.ReadLines(path).TakeLast(MaxOperationOutputLines).ToArray();
+            var output = ReadRecentOperationLines(path);
             var skip = (int)Math.Clamp(afterSequence, 0, output.Length);
             return new SteamOperationView("history", "Último registro salvo",
                 "Este é o log mais recente do perfil. Ele não indica uma operação em andamento.",
@@ -75,6 +77,21 @@ public sealed class SteamCmdService(
             logger.LogDebug(ex, "DSS could not read the latest SteamCMD log for profile {ProfileId}", profileId);
             return null;
         }
+    }
+
+    private static string[] ReadRecentOperationLines(string path)
+    {
+        var output = new Queue<string>();
+        var characters = 0;
+        foreach (var line in File.ReadLines(path))
+        {
+            var visible = line.Length > MaxSteamCmdLineChars ? line[^MaxSteamCmdLineChars..] : line;
+            output.Enqueue(visible);
+            characters += visible.Length;
+            while (output.Count > MaxOperationOutputLines || characters > MaxCapturedOutputChars)
+                characters -= output.Dequeue().Length;
+        }
+        return output.ToArray();
     }
 
     private string? FindLatestOperationLogPath(Guid profileId)
@@ -445,7 +462,18 @@ public sealed class SteamCmdService(
                 }
             }
             var marker = Path.Combine(Path.GetFullPath(profile.InstallPath), ".dss-server.json");
-            await File.WriteAllTextAsync(marker, JsonSerializer.Serialize(new { appId = adapter.SteamAppId, buildId = installedBuild, installedAt = DateTimeOffset.UtcNow }));
+            var markerSaved = true;
+            try
+            {
+                await File.WriteAllTextAsync(marker, JsonSerializer.Serialize(new { appId = adapter.SteamAppId, buildId = installedBuild, installedAt = DateTimeOffset.UtcNow }));
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                markerSaved = false;
+                operation.AddOutput($"DSS: os arquivos do jogo foram atualizados, mas o marcador '{marker}' não pôde ser gravado. Verifique se a conta que executa o DSS tem permissão de gravação na pasta.");
+                logger.LogWarning(ex, "SteamCMD updated profile {ProfileId}, but DSS could not write its build marker at {MarkerPath}", profileId, marker);
+            }
+            var markerWarning = markerSaved ? "" : " O jogo foi atualizado, mas o DSS não conseguiu gravar o arquivo .dss-server.json. Verifique a permissão de gravação da conta do DSS na pasta do servidor; a execução padrão continua sem privilégios de administrador.";
             await state.UpdateAsync(data =>
             {
                 var current = data.Instances.FirstOrDefault(item => item.Id == profileId);
@@ -481,13 +509,13 @@ public sealed class SteamCmdService(
                 var start = await supervisor.StartAsync(startProfile);
                 if (!start.Success) throw new InvalidOperationException($"O servidor foi instalado, mas não iniciou: {start.Message}");
                 operation.Set("success", buildMismatch ? "Servidor iniciado · build divergente" : "Servidor iniciado",
-                    buildMismatch ? buildMismatchMessage : $"{adapter.DisplayName} foi instalado/atualizado e iniciado.");
+                    (buildMismatch ? buildMismatchMessage : $"{adapter.DisplayName} foi instalado/atualizado e iniciado.") + markerWarning);
             }
             else operation.Set("success", buildMismatch ? "Instalação concluída · build divergente" : "Atualização concluída", buildMismatch
                 ? buildMismatchMessage
                 : string.IsNullOrWhiteSpace(installedBuild)
-                    ? $"{adapter.DisplayName} foi instalado/atualizado com sucesso."
-                    : $"{adapter.DisplayName} está instalado no build {installedBuild}.");
+                    ? $"{adapter.DisplayName} foi instalado/atualizado com sucesso.{markerWarning}"
+                    : $"{adapter.DisplayName} está instalado no build {installedBuild}.{markerWarning}");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -499,7 +527,23 @@ public sealed class SteamCmdService(
             operation.AddOutput("DSS: " + ex.Message);
             logger.LogError(ex, "DSS failed to install/update game for profile {ProfileId}", profileId);
         }
-        finally { operation.DisposeCancellation(); }
+        finally
+        {
+            operation.DisposeCancellation();
+            _ = RetireOperationSnapshotAsync(profileId, operation);
+        }
+    }
+
+    private async Task RetireOperationSnapshotAsync(Guid profileId, OperationState operation)
+    {
+        try
+        {
+            await Task.Delay(TimeSpan.FromMinutes(2), _stoppingToken);
+            if (operation.IsRunning) return;
+            ((ICollection<KeyValuePair<Guid, OperationState>>)_operations)
+                .Remove(new KeyValuePair<Guid, OperationState>(profileId, operation));
+        }
+        catch (OperationCanceledException) when (_stoppingToken.IsCancellationRequested) { }
     }
 
     private async Task RefreshBuildStateAsync(Guid profileId, IGameAdapter adapter, bool useCache, CancellationToken cancellationToken)
@@ -587,7 +631,7 @@ public sealed class SteamCmdService(
 
     private SteamCmdSettingsView ResolveSettings(string configuredDirectory)
     {
-        var defaultDirectory = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "steamcmd"));
+        var defaultDirectory = Path.GetFullPath(Path.Combine(state.ContentRootPath, "steamcmd"));
         if (!string.IsNullOrWhiteSpace(configuredDirectory))
         {
             var selected = Path.GetFullPath(configuredDirectory);
@@ -668,7 +712,8 @@ public sealed class SteamCmdService(
             using var process = new Process { StartInfo = start };
             if (!process.Start()) throw new InvalidOperationException("O SteamCMD não pôde ser iniciado.");
             process.StandardInput.Close();
-            var output = new StringBuilder();
+            var output = new Queue<string>();
+            var outputCharacters = 0;
             var consoleLogPath = Path.Combine(start.WorkingDirectory, "logs", "console_log.txt");
             var consoleLogTask = onOutput is null
                 ? Task.FromResult(false)
@@ -676,7 +721,16 @@ public sealed class SteamCmdService(
             var bootstrapStopTriggered = 0;
             void HandleLine(string line, bool partial)
             {
-                if (!partial) lock (output) output.AppendLine(line);
+                if (!partial)
+                {
+                    lock (output)
+                    {
+                        output.Enqueue(line);
+                        outputCharacters += line.Length + Environment.NewLine.Length;
+                        while (outputCharacters > MaxCapturedOutputChars && output.Count > 1)
+                            outputCharacters -= output.Dequeue().Length + Environment.NewLine.Length;
+                    }
+                }
                 if (partial) return;
                 if (IsSteamCmdBootstrapOutput(line) && Interlocked.Exchange(ref bootstrapStopTriggered, 1) == 0)
                 {
@@ -693,10 +747,12 @@ public sealed class SteamCmdService(
                 await process.WaitForExitAsync(cancellationToken);
                 await Task.WhenAll(outTask, errorTask);
                 var loggedToConsoleFile = await consoleLogTask;
+                string capturedOutput;
+                lock (output) capturedOutput = string.Join(Environment.NewLine, output);
                 if (onOutput is not null && !loggedToConsoleFile)
-                    foreach (var line in output.ToString().Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
+                    foreach (var line in output)
                         onOutput(line, false);
-                return (process.ExitCode, output.ToString());
+                return (process.ExitCode, capturedOutput);
             }
             catch
             {
@@ -715,6 +771,13 @@ public sealed class SteamCmdService(
     {
         var line = new StringBuilder();
         var buffer = new char[1024];
+        var lineTruncated = false;
+        void FlushLine()
+        {
+            onLine(lineTruncated ? line + " … [linha truncada]" : line.ToString(), false);
+            line.Clear();
+            lineTruncated = false;
+        }
         while (true)
         {
             var count = await reader.ReadAsync(buffer.AsMemory(), cancellationToken);
@@ -723,15 +786,13 @@ public sealed class SteamCmdService(
             {
                 var character = buffer[index];
                 if (character is '\r' or '\n')
-                {
-                    onLine(line.ToString(), false);
-                    line.Clear();
-                }
-                else line.Append(character);
+                    FlushLine();
+                else if (line.Length < MaxSteamCmdLineChars) line.Append(character);
+                else lineTruncated = true;
             }
-            if (line.Length > 0) onLine(line.ToString(), true);
+            if (line.Length > 0 || lineTruncated) onLine(lineTruncated ? line + " … [linha truncada]" : line.ToString(), true);
         }
-        if (line.Length > 0) onLine(line.ToString(), false);
+        if (line.Length > 0 || lineTruncated) FlushLine();
     }
 
     private static async Task<bool> TailSteamCmdConsoleLogAsync(string path, Process process, Action<string, bool> onOutput,
@@ -783,7 +844,7 @@ public sealed class SteamCmdService(
                                 }
                                 else
                                 {
-                                    pending.Append(character);
+                                    if (pending.Length < MaxSteamCmdLineChars) pending.Append(character);
                                     previousWasCarriageReturn = false;
                                 }
                             }
@@ -957,6 +1018,8 @@ public sealed class SteamCmdService(
     private sealed class OperationState
     {
         private const int MaxOutputLines = 1000;
+        private const int MaxOutputCharacters = 512 * 1024;
+        private const int MaxVisibleLineCharacters = 16 * 1024;
         private readonly bool startsServerAfterInstall;
         private readonly object _gate = new();
         private readonly Queue<string> _output = new();
@@ -964,6 +1027,7 @@ public sealed class SteamCmdService(
         private readonly StreamWriter _logWriter;
         private long _outputBaseSequence;
         private long _outputSequence;
+        private int _outputCharacters;
         private long _revision;
         private TaskCompletionSource<bool> _changed = NewChangeSignal();
         private string _state = "queued";
@@ -1030,10 +1094,16 @@ public sealed class SteamCmdService(
                 _currentOutputLine = null;
                 if (line.Length > 0)
                 {
-                    _output.Enqueue(line);
-                    _outputSequence++;
                     _logWriter.WriteLine(line);
-                    if (_output.Count > MaxOutputLines) { _output.Dequeue(); _outputBaseSequence++; }
+                    var visible = line.Length > MaxVisibleLineCharacters ? line[^MaxVisibleLineCharacters..] : line;
+                    _output.Enqueue(visible);
+                    _outputCharacters += visible.Length;
+                    _outputSequence++;
+                    while (_output.Count > MaxOutputLines || _outputCharacters > MaxOutputCharacters)
+                    {
+                        _outputCharacters -= _output.Dequeue().Length;
+                        _outputBaseSequence++;
+                    }
                 }
                 if (changed) SignalChanged();
             }

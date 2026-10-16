@@ -124,7 +124,11 @@ export async function streamApi(path, options = {}, onEvent = () => {}) {
 }
 
 export const json = value => JSON.stringify(value);
-export const fmtDate = value => value ? new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value)) : '—';
+export const fmtDate = value => {
+  if (!value) return '—';
+  const uiLocale = typeof document !== 'undefined' ? document.documentElement.lang : '';
+  return new Intl.DateTimeFormat(uiLocale || 'pt-BR', { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
+};
 export function bytes(value = 0) {
   const n = Number(value) || 0;
   if (n < 1024) return `${n} B`;

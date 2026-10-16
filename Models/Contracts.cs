@@ -10,7 +10,9 @@ public sealed class AppData
     public List<FailedLoginAttempt> FailedLoginAttempts { get; set; } = [];
     public bool FailedLoginAttemptsAggregated { get; set; }
     public string SteamCmdDirectory { get; set; } = "";
-    public string UiLanguage { get; set; } = "pt-BR";
+    // Legacy host-wide value retained so existing state files continue to load.
+    // UI language is now stored on each DssUser.
+    public string UiLanguage { get; set; } = "en-US";
     public List<ServerProfile> Instances { get; set; } = [];
     public List<ConfigRevision> Revisions { get; set; } = [];
     public List<InstalledMod> InstalledMods { get; set; } = [];
@@ -93,6 +95,7 @@ public sealed class DssUser
     public string Username { get; set; } = "";
     public string PasswordHash { get; set; } = "";
     public string Role { get; set; } = "user";
+    public string? UiLanguage { get; set; }
     public DateTimeOffset CreatedAt { get; set; } = DateTimeOffset.UtcNow;
     public int FailedLoginCount { get; set; }
     public DateTimeOffset? FailedLoginWindowStartedAt { get; set; }
@@ -128,6 +131,15 @@ public sealed class ConfigRevision
     public Guid? ActorUserId { get; set; }
     public string? ActorName { get; set; }
     public long? ActorImageVersion { get; set; }
+    public string ModProvider { get; set; } = "";
+    public string ModPackageId { get; set; } = "";
+    public string ModName { get; set; } = "";
+    public string ModVersion { get; set; } = "";
+    public string? ModIconUrl { get; set; }
+    public string? ModProjectUrl { get; set; }
+    public List<string> FilesInstalled { get; set; } = [];
+    public List<string> FilesRemoved { get; set; } = [];
+    public List<string> FilesPreserved { get; set; } = [];
 }
 
 public sealed class InstalledMod
@@ -268,7 +280,18 @@ public sealed record RevisionView(
     string Summary,
     bool CanRollback,
     string ActorName,
-    string? ActorImageUrl);
+    string? ActorImageUrl)
+{
+    public string? ModProvider { get; init; }
+    public string? ModPackageId { get; init; }
+    public string? ModName { get; init; }
+    public string? ModVersion { get; init; }
+    public string? ModIconUrl { get; init; }
+    public string? ModProjectUrl { get; init; }
+    public IReadOnlyList<string> FilesInstalled { get; init; } = [];
+    public IReadOnlyList<string> FilesRemoved { get; init; } = [];
+    public IReadOnlyList<string> FilesPreserved { get; init; } = [];
+}
 
 public sealed record RevisionDetailView(
     Guid Id,
@@ -282,7 +305,18 @@ public sealed record RevisionDetailView(
     bool HasSnapshot,
     bool CanRollback,
     string ActorName,
-    string? ActorImageUrl);
+    string? ActorImageUrl)
+{
+    public string? ModProvider { get; init; }
+    public string? ModPackageId { get; init; }
+    public string? ModName { get; init; }
+    public string? ModVersion { get; init; }
+    public string? ModIconUrl { get; init; }
+    public string? ModProjectUrl { get; init; }
+    public IReadOnlyList<string> FilesInstalled { get; init; } = [];
+    public IReadOnlyList<string> FilesRemoved { get; init; } = [];
+    public IReadOnlyList<string> FilesPreserved { get; init; } = [];
+}
 
 public sealed record ModDependentView(Guid Id, string PackageId, string Name, string Version, string Provider, int Depth);
 

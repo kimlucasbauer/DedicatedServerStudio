@@ -52,6 +52,9 @@ export function ToastProvider({ children }) {
       title: options.title || (kind === 'error' ? 'A operação precisa de atenção' : kind === 'progress' ? 'Em andamento' : 'Concluído'),
       message: text,
       detail: options.detail || '',
+      modDetails: Array.isArray(options.modDetails) ? options.modDetails.slice(0, 24).map(item => ({
+        provider: String(item?.provider || ''), packageId: String(item?.packageId || ''), name: String(item?.name || '')
+      })).filter(item => item.provider && item.packageId) : [],
       progress: Number.isFinite(options.progress) ? Math.max(0, Math.min(100, options.progress)) : null,
       progressText: options.progressText || '',
       createdAt: previous?.createdAt || repeated?.createdAt || now,

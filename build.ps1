@@ -17,7 +17,20 @@ try {
     finally { Pop-Location }
     & dotnet restore $projectFile --configfile .\NuGet.Config
     if ($LASTEXITCODE -ne 0) { throw "dotnet restore failed with exit code $LASTEXITCODE" }
-    & dotnet build $projectFile --no-restore
+    & dotnet build $projectFile -c Release --no-restore
     if ($LASTEXITCODE -ne 0) { throw "dotnet build failed with exit code $LASTEXITCODE" }
+
+    $builtAssembly = Join-Path $projectRoot 'bin\Release\net10.0\DedicatedServerStudio.dll'
+    if (-not (Test-Path -LiteralPath $builtAssembly -PathType Leaf)) { throw 'Built DSS assembly was not found.' }
+    $runtimeManifest = [ordered]@{
+        assemblyPath = 'bin/Release/net10.0/DedicatedServerStudio.dll'
+        sha256 = (Get-FileHash -LiteralPath $builtAssembly -Algorithm SHA256).Hash
+        builtAt = (Get-Date).ToString('o')
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $projectRoot 'dss-runtime.json'),
+        ($runtimeManifest | ConvertTo-Json -Depth 3),
+        [Text.UTF8Encoding]::new($false)
+    )
 }
 finally { Pop-Location }

@@ -2,15 +2,20 @@
 
 Dedicated Server Studio is a self-hosted control panel for installing, configuring, and operating dedicated game servers from one place. Its goal is to make dedicated servers easier to manage as your game library grows, with shared profiles, clear server controls, live status, and practical tools for mods, players, and troubleshooting. Valheim is the first supported game; the project is designed to add other dedicated-server games over time.
 
+See [CHANGELOG.md](CHANGELOG.md) for additions and adjustments in each release.
+
 ## What DSS can do
 
 - Organize servers into profiles. A profile can contain multiple Valheim servers that share one game installation and mod setup while keeping each world's public name, world, port, saves, startup options, and console separate.
 - Install and update Valheim Dedicated Server through SteamCMD, including supported server branches. The panel shows installation progress and the installed build when it can be read from the game files.
-- Find and install Thunderstore mods, import a r2modman profile using its profile code or exported file, and manage BepInEx configuration files.
+- Search the Thunderstore, Hexium, Nexus Mods, and CurseForge catalogs; review dependency and version requirements; install mods; import r2modman profiles; and edit BepInEx configuration files.
 - Start, stop, restart, and monitor servers, with resource and player status where the server exposes that information.
 - View each server's recent console output, copy it, or download the complete current log. The on-screen console keeps the latest 1,000 lines to stay responsive.
-- Manage player access lists and supported live actions, including admin, permitted, banned, and kick operations.
-- Create DSS user accounts and grant profile access with roles.
+- Review per-profile activity, compare configuration changes, and inspect mod versions and managed files.
+- Manage recognized players, access lists, and supported live actions, including admin, permitted, banned, and kick operations.
+- Check local and public addresses and test whether a running server answers a network query.
+- Create DSS user accounts and grant profile access with roles. The built-in `admin` account always remains an administrator.
+- Choose an interface language for each account: English, Brazilian Portuguese, Spanish, French, German, Russian, or Simplified Chinese. English is used until an account saves a different preference under **Settings → Preferences**.
 - Export and import profile settings and installed mod metadata. BepInEx files themselves are not included in that export.
 
 ## Get started
@@ -35,7 +40,7 @@ The output must include `Microsoft.AspNetCore.App 10.x` under `C:\Program Files\
 
 1. Extract the production ZIP into a folder the Windows account can write to. Avoid protected folders such as `Program Files` unless permissions are configured.
 2. Run `DSS.cmd`. Keep its terminal open while the panel is running; it owns the DSS process and shows startup errors if something goes wrong.
-3. Open `http://127.0.0.1:5089` in a browser and create the administrator account.
+3. Open `http://127.0.0.1:5089` in a browser and create the administrator account. The built-in `admin` account cannot be changed to a regular user.
 4. Create a profile, then use its settings to choose the server installation folder and other profile options.
 5. Open the profile's server controls and install the game through SteamCMD. Create or select a server, set its public name, world, port, and save options, then start it.
 6. Add mods from the profile's mod page or import a r2modman profile. Mods and BepInEx configuration are shared by the servers in that profile.
@@ -44,7 +49,7 @@ If startup fails, the launcher leaves the terminal open and prints the startup l
 
 ## Nexus Mods downloads
 
-The Nexus catalog can be searched with a personal API key, but that key does not override the download permissions on your Nexus account. If Nexus allows your account to use a direct download, DSS uses that official API flow. Otherwise, authorize the exact file before installing it:
+The Nexus catalog can be searched with a personal API key, but that key does not override the download permissions on your Nexus account. If Nexus allows your account to use a direct download, DSS uses that official API flow. Otherwise, authorize the exact file before installing it. Other connected catalogs can be used without a Nexus account:
 
 1. In **Integrations → Nexus**, configure and validate your personal API key.
 2. On the Nexus page for the required Valheim mod file, open the context menu on **Download with Manager** and choose **Copy link address**. The copied address should start with `nxm://` and contain `key` and `expires` values.
@@ -58,7 +63,7 @@ A profile represents a shared game installation and mod environment. Add multipl
 
 ## Administrator mode and network access
 
-DSS can run normally without administrator privileges. In standard mode, it can manage and start servers, but Windows may block incoming game connections until the firewall is configured.
+DSS starts in standard Windows mode by default and does not request administrator privileges. In standard mode, it can manage and start servers, but Windows may block incoming game connections until the firewall is configured.
 
 The permission status in the top bar shows whether DSS is running as administrator. Click it to choose a mode. If administrator mode is selected, Windows asks for UAC approval and DSS restarts elevated. The choice is saved in the editable `dss-config.json` beside the application; set `runAsAdministrator` to `false` to use standard mode on the next launch.
 
@@ -72,7 +77,7 @@ Public access is risky. DSS currently uses HTTP without TLS, so credentials and 
 
 The game and SteamCMD consoles display the latest 1,000 lines for a responsive view. Use the copy button for the visible console text or the download button to save the complete current log. The game server's standard console does not accept typed commands unless a compatible server mod is installed; for Valheim, DSS supports [DreamWraith ConsoleStdinHeeler](https://thunderstore.io/c/valheim/p/DreamWraith/ConsoleStdinHeeler/).
 
-Profiles, accounts, saves, and mods are kept outside the application folder, in `%LOCALAPPDATA%\DedicatedServerStudio` by default. New DSS logs are stored under the application folder's `logs` directory: startup and application logs at the root, SteamCMD logs in `logs\steamcmd`, and server console logs in `logs\servers\<server-id>`. Existing console logs are copied from the old data folder when a server is next started under this version; the old copy is kept. A server already running during an upgrade keeps using its existing console log path until it is stopped and started again. Set the `DSS_DATA_DIR` environment variable to use a different data folder for profiles and saves. SteamCMD is downloaded on first use and can be moved in Preferences.
+Profiles, accounts, saves, and mods are kept outside the application folder, in `%LOCALAPPDATA%\DedicatedServerStudio` by default. New DSS logs are stored under the application folder's `logs` directory: startup and application logs at the root, SteamCMD logs in `logs\steamcmd`, and server console logs in `logs\servers\<server-id>`. Recognized player history is kept with DSS data so replacing or moving the application folder does not erase the roster. Existing player history from older installs is migrated automatically when its previous logs folder is still available. Existing console logs are copied from the old data folder when a server is next started under this version; the old copy is kept. A server already running during an upgrade keeps using its existing console log path until it is stopped and started again. Set the `DSS_DATA_DIR` environment variable to use a different data folder for profiles and saves. SteamCMD is downloaded on first use and can be moved in Preferences.
 
 Removing a profile keeps its game files and saves unless you explicitly select those items in the removal dialog. Back up important worlds before making destructive changes.
 
@@ -82,9 +87,9 @@ Valheim is the only game adapter currently available. Some status and player det
 
 ## Automatic updates
 
-When an administrator signs in, DSS checks the latest public GitHub Release for this repository. If a newer version is available, the update button appears beside the DSS logo. Review the release notes and confirm the update in the dialog to download the matching production ZIP and restart the panel. The updater preserves `dss-config.json`, profiles, server files, credentials, and logs. Stop all managed game servers and wait for SteamCMD operations to finish before confirming an update.
+When an administrator signs in, DSS checks the latest public GitHub Release for this repository. If a newer version is available, the update button appears beside the DSS logo. Review the release notes and confirm the update in the dialog to download the matching production ZIP and restart the panel. The updater preserves `dss-config.json`, profiles, server files, credentials, and logs. Dedicated servers with a connected persistent console bridge remain running while the panel restarts; their consoles and live management reconnect when DSS returns. If an older server process has no persistent bridge, DSS asks you to restart it once before updating. Wait for SteamCMD operations to finish before confirming an update.
 
-Releases should use semantic-version tags such as `v0.3.6` and attach a production package named `DedicatedServerStudio-0.3.6-production.zip`. DSS checks the package SHA-256 when GitHub provides its release-asset digest, validates the runtime manifest, and keeps a temporary copy of application files so it can restore them if the new build does not start.
+Releases use semantic-version tags and attach a matching production package. For this release, use tag `v0.4.0` and package `DedicatedServerStudio-0.4.0-production.zip`. The production package omits machine-specific `dss-config.json`; a fresh install creates that file with `runAsAdministrator: false` on first launch, while an existing configuration is left untouched during manual extraction. DSS checks the package SHA-256 when GitHub provides its release-asset digest, validates the runtime manifest, and keeps a temporary copy of application files so it can restore them if the new build does not start.
 
 ## License
 

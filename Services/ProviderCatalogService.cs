@@ -1,7 +1,7 @@
-using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using DedicatedServerStudio.Models;
@@ -11,9 +11,7 @@ namespace DedicatedServerStudio.Services;
 public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderCredentialVault credentials,
     NexusDownloadAuthorizationService nexusDownloadAuthorizations)
 {
-    private static readonly TimeSpan CacheLifetime = TimeSpan.FromMinutes(15);
-    private readonly ConcurrentDictionary<string, (DateTimeOffset ExpiresAt, IReadOnlyList<CatalogPackage> Items)> _cache = new();
-    private readonly ConcurrentDictionary<string, Lazy<Task<IReadOnlyList<CatalogPackage>>>> _catalogLoads = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim _catalogReadGate = new(2, 2);
 
     public IReadOnlyList<ProviderView> GetProviders() =>
     [
@@ -48,7 +46,7 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 timeout.CancelAfter(TimeSpan.FromSeconds(7));
                 using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
-                request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.3.6");
+                request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
                 using var response = await clients.CreateClient("catalog").SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
                 var connection = response.StatusCode == HttpStatusCode.TooManyRequests ? "rate-limited"
                     : response.IsSuccessStatusCode ? "reachable" : "unavailable";
@@ -91,12 +89,12 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
             ? "https://api.nexusmods.com/v1/users/validate.json"
             : "https://api.curseforge.com/v1/games/455";
         using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
-        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.3.6");
+        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
         if (provider.Id == "nexus")
         {
             request.Headers.TryAddWithoutValidation("apikey", key);
             request.Headers.TryAddWithoutValidation("Application-Name", "Dedicated Server Studio");
-            request.Headers.TryAddWithoutValidation("Application-Version", "0.3.6");
+            request.Headers.TryAddWithoutValidation("Application-Version", "0.4.0");
             request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
         }
         else request.Headers.TryAddWithoutValidation("x-api-key", key);
@@ -135,15 +133,26 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
     {
         if (provider.Equals("nexus", StringComparison.OrdinalIgnoreCase))
             return await SearchNexusAsync(query, fields, page, pageSize, sort, direction, cancellationToken);
-        var all = await GetCatalogAsync(provider, cancellationToken);
-        var filtered = FilterPackages(all, query, fields);
         var safePageSize = Math.Clamp(pageSize, 6, 48);
-        var total = includeTotal ? filtered.Count() : (int?)null;
-        var totalPages = total.HasValue ? Math.Max(1, (int)Math.Ceiling(total.Value / (double)safePageSize)) : (int?)null;
-        var safePage = totalPages.HasValue ? Math.Clamp(page, 1, totalPages.Value) : Math.Max(1, page);
-        var ordered = SortPackages(filtered, sort, direction);
-        var items = ordered.Skip((safePage - 1) * safePageSize).Take(safePageSize).ToArray();
-        return new CatalogSearchPage(items, total, safePage, totalPages, safePageSize);
+        var safePage = Math.Clamp(page, 1, 1000);
+        var retainedCount = checked(safePage * safePageSize);
+        var comparer = CreatePackageComparer(sort, direction);
+        var best = new SortedSet<CatalogPackage>(comparer);
+        var matches = 0;
+        await foreach (var raw in EnumerateThunderstorePackagesAsync(provider, cancellationToken))
+        {
+            if (raw.IsDeprecated == true || raw.Versions is not { Count: > 0 }) continue;
+            var item = MapThunderstoreCatalogPackage(provider, raw);
+            if (!MatchesPackage(item, query, fields)) continue;
+            matches++;
+            best.Add(item);
+            if (best.Count > retainedCount) best.Remove(best.Max!);
+        }
+        var totalPages = Math.Max(1, (int)Math.Ceiling(matches / (double)safePageSize));
+        safePage = Math.Clamp(safePage, 1, totalPages);
+        var items = best.Skip((safePage - 1) * safePageSize).Take(safePageSize).ToArray();
+        // Counting is done during the same stream pass, so the UI does not need a second full-catalog request.
+        return new CatalogSearchPage(items, matches, safePage, totalPages, safePageSize);
     }
 
     public async Task<CatalogSearchCount> CountAsync(string provider, string query, IReadOnlyCollection<string> fields,
@@ -156,54 +165,55 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
             var nexusPageSize = Math.Clamp(pageSize, 6, 48);
             return new CatalogSearchCount(nexusTotal, Math.Max(1, (int)Math.Ceiling(nexusTotal / (double)nexusPageSize)), nexusPageSize);
         }
-        var all = await GetCatalogAsync(provider, cancellationToken);
-        var total = FilterPackages(all, query, fields).Count();
+        var total = 0;
+        await foreach (var raw in EnumerateThunderstorePackagesAsync(provider, cancellationToken))
+        {
+            if (raw.IsDeprecated == true || raw.Versions is not { Count: > 0 }) continue;
+            if (MatchesPackage(MapThunderstoreCatalogPackage(provider, raw), query, fields)) total++;
+        }
         var safePageSize = Math.Clamp(pageSize, 6, 48);
         return new CatalogSearchCount(total, Math.Max(1, (int)Math.Ceiling(total / (double)safePageSize)), safePageSize);
     }
 
-    private static IEnumerable<CatalogPackage> FilterPackages(IReadOnlyList<CatalogPackage> all, string query,
-        IReadOnlyCollection<string> fields)
+    private static bool MatchesPackage(CatalogPackage item, string query, IReadOnlyCollection<string> fields)
     {
-        var selectedFields = fields.Select(field => field.ToLowerInvariant()).Where(field => field is "title" or "creator" or "description" or "packageid" or "version" or "tags")
-            .Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-        if (selectedFields.Length == 0) selectedFields = ["title", "creator", "description", "packageid"];
-        if (string.IsNullOrWhiteSpace(query)) return all;
-
+        if (string.IsNullOrWhiteSpace(query)) return true;
         var needle = query.Trim();
         var creatorNeedle = NormalizeCreatorQuery(needle);
-        return all.Where(item => selectedFields.Any(field => field switch
+        var hasSupportedField = false;
+        foreach (var rawField in fields)
         {
-            "title" => item.Name.Contains(needle, StringComparison.OrdinalIgnoreCase),
-            "creator" => CreatorMatches(item, creatorNeedle),
-            "description" => item.Description.Contains(needle, StringComparison.OrdinalIgnoreCase),
-            "packageid" => item.PackageId.Contains(needle, StringComparison.OrdinalIgnoreCase),
-            "version" => item.Version.Contains(needle, StringComparison.OrdinalIgnoreCase),
-            "tags" => item.Categories?.Any(category => category.Contains(needle, StringComparison.OrdinalIgnoreCase)) == true,
-            _ => false
-        }));
+            var field = rawField.Trim();
+            if (field.Equals("title", StringComparison.OrdinalIgnoreCase)) { hasSupportedField = true; if (item.Name.Contains(needle, StringComparison.OrdinalIgnoreCase)) return true; }
+            else if (field.Equals("creator", StringComparison.OrdinalIgnoreCase)) { hasSupportedField = true; if (CreatorMatches(item, creatorNeedle)) return true; }
+            else if (field.Equals("description", StringComparison.OrdinalIgnoreCase)) { hasSupportedField = true; if (item.Description.Contains(needle, StringComparison.OrdinalIgnoreCase)) return true; }
+            else if (field.Equals("packageId", StringComparison.OrdinalIgnoreCase)) { hasSupportedField = true; if (item.PackageId.Contains(needle, StringComparison.OrdinalIgnoreCase)) return true; }
+            else if (field.Equals("version", StringComparison.OrdinalIgnoreCase)) { hasSupportedField = true; if (item.Version.Contains(needle, StringComparison.OrdinalIgnoreCase)) return true; }
+            else if (field.Equals("tags", StringComparison.OrdinalIgnoreCase)) { hasSupportedField = true; if (item.Categories?.Any(category => category.Contains(needle, StringComparison.OrdinalIgnoreCase)) == true) return true; }
+        }
+        return !hasSupportedField && (item.Name.Contains(needle, StringComparison.OrdinalIgnoreCase) ||
+            CreatorMatches(item, creatorNeedle) || item.Description.Contains(needle, StringComparison.OrdinalIgnoreCase) ||
+            item.PackageId.Contains(needle, StringComparison.OrdinalIgnoreCase));
     }
 
-    private static IEnumerable<CatalogPackage> SortPackages(IEnumerable<CatalogPackage> filtered, string sort, string direction)
-    {
-        var descending = !direction.Equals("asc", StringComparison.OrdinalIgnoreCase);
-        return sort switch
+    private static IComparer<CatalogPackage> CreatePackageComparer(string sort, string direction) =>
+        Comparer<CatalogPackage>.Create((left, right) =>
         {
-            "title" => descending ? filtered.OrderByDescending(item => item.Name, StringComparer.OrdinalIgnoreCase) : filtered.OrderBy(item => item.Name, StringComparer.OrdinalIgnoreCase),
-            "creator" => descending ? filtered.OrderByDescending(item => item.Owner, StringComparer.OrdinalIgnoreCase).ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase) : filtered.OrderBy(item => item.Owner, StringComparer.OrdinalIgnoreCase).ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase),
-            "recent" => descending ? filtered.OrderByDescending(item => item.UpdatedAt ?? DateTimeOffset.MinValue) : filtered.OrderBy(item => item.UpdatedAt ?? DateTimeOffset.MinValue),
-            "downloads" => descending ? filtered.OrderByDescending(item => item.TotalDownloads).ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase) : filtered.OrderBy(item => item.TotalDownloads).ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase),
-            _ => descending ? filtered.OrderByDescending(item => item.TotalDownloads).ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase) : filtered.OrderBy(item => item.TotalDownloads).ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
-        };
-    }
-
-    public async Task<IReadOnlyList<CatalogPackage>> RefreshAsync(string provider, CancellationToken cancellationToken)
-    {
-        if (provider.Equals("nexus", StringComparison.OrdinalIgnoreCase))
-            return (await SearchNexusAsync("", [], 1, 48, "downloads", "desc", cancellationToken)).Items;
-        _cache.TryRemove(provider.Trim().ToLowerInvariant(), out _);
-        return await GetCatalogAsync(provider, cancellationToken);
-    }
+            var ascending = direction.Equals("asc", StringComparison.OrdinalIgnoreCase);
+            var comparison = sort switch
+            {
+                "title" => StringComparer.OrdinalIgnoreCase.Compare(left.Name, right.Name),
+                "creator" => StringComparer.OrdinalIgnoreCase.Compare(left.Owner, right.Owner),
+                "recent" => Nullable.Compare(left.UpdatedAt, right.UpdatedAt),
+                _ => left.TotalDownloads.CompareTo(right.TotalDownloads)
+            };
+            if (!ascending) comparison = -comparison;
+            if (comparison == 0 && sort == "creator")
+                comparison = StringComparer.OrdinalIgnoreCase.Compare(left.Name, right.Name);
+            else if (comparison == 0 && sort is not ("title" or "recent" or "creator"))
+                comparison = StringComparer.OrdinalIgnoreCase.Compare(left.Name, right.Name);
+            return comparison != 0 ? comparison : StringComparer.OrdinalIgnoreCase.Compare(left.PackageId, right.PackageId);
+        });
 
     public async Task<CatalogPackage?> FindPackageAsync(string provider, string packageId, CancellationToken cancellationToken,
         string? version = null, string? minimumVersion = null, bool includeDownloadLink = false)
@@ -234,22 +244,9 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
                 IconUrl = nexusSelected.IconUrl, DownloadUrl = nexusDownloadUrl, FileSize = nexusSelected.FileSize,
                 Dependencies = nexusSelected.Dependencies, UpdatedAt = nexusSelected.CreatedAt };
         }
-        var all = await GetCatalogAsync(provider, cancellationToken);
-        var package = all.FirstOrDefault(item => string.Equals(item.PackageId, packageId, StringComparison.OrdinalIgnoreCase));
-        if (package is null && (provider.Equals("thunderstore", StringComparison.OrdinalIgnoreCase) || provider.Equals("ts", StringComparison.OrdinalIgnoreCase) || provider.Equals("hexium", StringComparison.OrdinalIgnoreCase) || provider.Equals("hex", StringComparison.OrdinalIgnoreCase)))
-        {
-            // Thunderstore's API can expose the package team as `owner` while older responses use
-            // `namespace`; match both forms so dependencies resolve by their canonical team-name ID.
-            var separator = packageId.IndexOf('-');
-            if (separator > 0 && separator < packageId.Length - 1)
-            {
-                var team = packageId[..separator];
-                var name = packageId[(separator + 1)..];
-                package = all.FirstOrDefault(item => string.Equals(item.Name, name, StringComparison.OrdinalIgnoreCase) &&
-                    (string.Equals(item.Owner, team, StringComparison.OrdinalIgnoreCase) ||
-                     item.PackageId.StartsWith(team + "-", StringComparison.OrdinalIgnoreCase)));
-            }
-        }
+        var normalizedProvider = NormalizeThunderstoreProvider(provider);
+        var package = await FindThunderstorePackageOnlineAsync(normalizedProvider, packageId, cancellationToken,
+            includeVersions: !string.IsNullOrWhiteSpace(version) || !string.IsNullOrWhiteSpace(minimumVersion));
         if (package is null) return null;
         var versions = package.Versions?.ToList() ?? [];
         if (versions.All(item => !item.Version.Equals(package.Version, StringComparison.OrdinalIgnoreCase)))
@@ -269,6 +266,128 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
         return package with { Version = selected.Version, Description = selected.Description,
             IconUrl = selected.IconUrl, DownloadUrl = downloadUrl, FileSize = selected.FileSize,
             Dependencies = selected.Dependencies, UpdatedAt = selected.CreatedAt };
+    }
+
+    public async Task<CatalogPackage?> FindPackageOnlineAsync(string provider, string packageId, CancellationToken cancellationToken)
+    {
+        if (provider.Equals("nexus", StringComparison.OrdinalIgnoreCase))
+            return await FindPackageAsync("nexus", packageId, cancellationToken);
+        var normalized = NormalizeThunderstoreProvider(provider);
+        return await FindThunderstorePackageOnlineAsync(normalized, packageId, cancellationToken, includeVersions: true);
+    }
+
+    public async Task<IReadOnlyList<CatalogPackage>> FindPackagesOnlineAsync(string provider,
+        IReadOnlyCollection<string> packageIds, CancellationToken cancellationToken)
+    {
+        var ids = packageIds.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        if (ids.Length == 0) return [];
+        if (provider.Equals("nexus", StringComparison.OrdinalIgnoreCase))
+        {
+            var nexusResults = new List<CatalogPackage>(ids.Length);
+            foreach (var id in ids)
+            {
+                var item = await FindPackageOnlineAsync("nexus", id, cancellationToken);
+                if (item is not null) nexusResults.Add(item);
+            }
+            return nexusResults;
+        }
+
+        var normalized = NormalizeThunderstoreProvider(provider);
+        var wanted = ids.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var found = new List<CatalogPackage>(ids.Length);
+        await foreach (var raw in EnumerateThunderstorePackagesAsync(normalized, cancellationToken))
+        {
+            if (raw.IsDeprecated == true || raw.Versions is not { Count: > 0 }) continue;
+            var summary = MapThunderstoreCatalogPackage(normalized, raw);
+            var packageId = summary.PackageId;
+            if (!wanted.Contains(packageId)) continue;
+            found.Add(summary);
+            wanted.Remove(packageId);
+            if (wanted.Count == 0) break;
+        }
+        return found;
+    }
+
+    private static string NormalizeThunderstoreProvider(string provider) => provider.Trim().ToLowerInvariant() switch
+    {
+        "ts" or "bepinex" => "thunderstore",
+        "hex" => "hexium",
+        var value => value
+    };
+
+    private async Task<CatalogPackage?> FindThunderstorePackageOnlineAsync(string provider, string packageId,
+        CancellationToken cancellationToken, bool includeVersions)
+    {
+        var normalized = NormalizeThunderstoreProvider(provider);
+        var endpoint = normalized switch
+        {
+            "thunderstore" => "https://thunderstore.io/c/valheim/api/v1/package/",
+            "hexium" => "https://valheim.hexium.gg/api/v1/package/",
+            _ => throw new ProviderException("Este provedor não disponibiliza pacotes compatíveis com Thunderstore.")
+        };
+        using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
+        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0 (+self-hosted Valheim server manager)");
+        using var response = await clients.CreateClient("catalog").SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        if (response.StatusCode == HttpStatusCode.NotFound) return null;
+        if (response.StatusCode == HttpStatusCode.TooManyRequests)
+            throw new ProviderException($"{(normalized == "hexium" ? "Hexium" : "Thunderstore")} pediu uma pausa. Aguarde e tente novamente.");
+        response.EnsureSuccessStatusCode();
+        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        await foreach (var candidate in JsonSerializer.DeserializeAsyncEnumerable<ThunderstorePackage>(stream, cancellationToken: cancellationToken))
+        {
+            if (candidate is null || candidate.IsDeprecated == true || candidate.Versions is not { Count: > 0 }) continue;
+            var candidateId = ThunderstorePackageId(candidate);
+            if (!candidateId.Equals(packageId, StringComparison.OrdinalIgnoreCase) &&
+                !(string.Equals(candidate.Name, PackageName(packageId), StringComparison.OrdinalIgnoreCase) &&
+                  (string.Equals(candidate.Namespace, PackageOwner(packageId), StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(candidate.Owner, PackageOwner(packageId), StringComparison.OrdinalIgnoreCase)))) continue;
+            return MapThunderstorePackage(normalized, candidate, includeVersions);
+        }
+        return null;
+    }
+
+    private static string PackageName(string packageId)
+    {
+        var separator = packageId.IndexOf('-');
+        return separator > 0 && separator < packageId.Length - 1 ? packageId[(separator + 1)..] : packageId;
+    }
+
+    private static string PackageOwner(string packageId)
+    {
+        var separator = packageId.IndexOf('-');
+        return separator > 0 ? packageId[..separator] : "";
+    }
+
+    private static string ThunderstorePackageId(ThunderstorePackage package)
+    {
+        var team = package.Namespace;
+        if (string.IsNullOrWhiteSpace(team) && !string.IsNullOrWhiteSpace(package.FullName))
+        {
+            var separator = package.FullName.IndexOf('-');
+            if (separator > 0) team = package.FullName[..separator];
+        }
+        if (string.IsNullOrWhiteSpace(team)) team = package.Owner;
+        return string.IsNullOrWhiteSpace(package.FullName) ? $"{team}-{package.Name}" : package.FullName;
+    }
+
+    private static CatalogPackage MapThunderstorePackage(string provider, ThunderstorePackage package, bool includeVersions)
+    {
+        var versions = package.Versions ?? [];
+        var version = versions.FirstOrDefault(item => item.IsActive) ?? versions[0];
+        var allVersions = includeVersions
+            ? versions.Where(item => !string.IsNullOrWhiteSpace(item.VersionNumber)).Select(item =>
+                new CatalogVersion(item.VersionNumber!, item.Description ?? package.Name, item.Icon ?? package.PakeIcon,
+                    item.DownloadUrl, item.FileSize, item.Dependencies ?? [], ParseDate(item.DateCreated), item.Downloads)).ToArray()
+            : [];
+        var datedVersions = includeVersions ? allVersions.Where(item => item.CreatedAt.HasValue).Select(item => item.CreatedAt!.Value).ToArray() : [];
+        var createdAt = ParseDate(package.DateCreated) ?? (datedVersions.Length > 0 ? datedVersions.Min() : null);
+        var updatedAt = ParseDate(package.DateUpdated) ?? (datedVersions.Length > 0 ? datedVersions.Max() : ParseDate(version.DateCreated));
+        return new CatalogPackage(provider, ThunderstorePackageId(package), package.Name,
+            string.IsNullOrWhiteSpace(package.Namespace) ? package.Owner : package.Namespace,
+            version.VersionNumber ?? "", version.Description ?? package.Name,
+            version.Icon ?? package.PakeIcon, package.PackageUrl, version.DownloadUrl, version.FileSize,
+            version.Dependencies ?? [], package.TotalDownloads > 0 ? package.TotalDownloads : versions.Sum(item => item.Downloads),
+            updatedAt, allVersions, createdAt, ReadLong(package.RatingScore), package.Categories ?? []);
     }
 
     private async Task<CatalogPackage?> GetNexusPackageByIdAsync(string packageId, CancellationToken cancellationToken)
@@ -548,48 +667,12 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
         return new CatalogSearchPage(pageItems, total, Math.Min(safePage, totalPages), totalPages, safePageSize);
     }
 
-    private async Task<IReadOnlyList<CatalogPackage>> GetCatalogAsync(string provider, CancellationToken cancellationToken)
-    {
-        var normalizedProvider = provider.Trim().ToLowerInvariant();
-        var cacheKey = normalizedProvider switch { "ts" => "thunderstore", "hex" => "hexium", _ => normalizedProvider };
-        if (TryGetCached(cacheKey, out var cached)) return cached;
-        if (cacheKey is not ("thunderstore" or "hexium"))
-        {
-            throw new ProviderException("Este provedor usa uma busca paginada e não carrega o catálogo completo.");
-        }
-
-        var load = _catalogLoads.GetOrAdd(cacheKey, key => new Lazy<Task<IReadOnlyList<CatalogPackage>>>(
-            () => LoadCatalogAsync(key), LazyThreadSafetyMode.ExecutionAndPublication));
-        var catalogTask = load.Value;
-        _ = catalogTask.ContinueWith(_ => RemoveCatalogLoad(cacheKey, load), CancellationToken.None,
-            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-        return await catalogTask.WaitAsync(cancellationToken);
-    }
-
-    private void RemoveCatalogLoad(string key, Lazy<Task<IReadOnlyList<CatalogPackage>>> load) =>
-        ((ICollection<KeyValuePair<string, Lazy<Task<IReadOnlyList<CatalogPackage>>>>>)_catalogLoads)
-            .Remove(new KeyValuePair<string, Lazy<Task<IReadOnlyList<CatalogPackage>>>>(key, load));
-
-    private async Task<IReadOnlyList<CatalogPackage>> LoadCatalogAsync(string provider)
-    {
-        // One cold request feeds both the first result page and the separate total-count request.
-        // A bounded independent token lets a caller changing tabs stop waiting without starting
-        // another copy of the provider's full catalog download.
-        using var timeout = new CancellationTokenSource(provider == "nexus" ? TimeSpan.FromMinutes(2) : TimeSpan.FromSeconds(45));
-        return provider switch
-        {
-            "thunderstore" => await GetThunderstoreAsync(timeout.Token),
-            "hexium" => await GetHexiumAsync(timeout.Token),
-            _ => throw new ProviderException("Unknown provider.")
-        };
-    }
-
     private static void AddNexusHeaders(HttpRequestMessage request, string apiKey)
     {
         request.Headers.TryAddWithoutValidation("apikey", apiKey);
         request.Headers.TryAddWithoutValidation("Application-Name", "Dedicated Server Studio");
-        request.Headers.TryAddWithoutValidation("Application-Version", "0.3.6");
-        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.3.6");
+        request.Headers.TryAddWithoutValidation("Application-Version", "0.4.0");
+        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0");
         request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
     }
 
@@ -617,61 +700,49 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
         return null;
     }
 
-    private async Task<IReadOnlyList<CatalogPackage>> GetThunderstoreAsync(CancellationToken cancellationToken)
+    private async IAsyncEnumerable<ThunderstoreCatalogPackage> EnumerateThunderstorePackagesAsync(
+        string provider, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        if (TryGetCached("thunderstore", out var cached)) return cached;
-        var result = await GetThunderstoreCompatibleAsync("thunderstore", "https://thunderstore.io/c/valheim/api/v1/package/", cancellationToken);
-        SetCached("thunderstore", result);
-        return result;
-    }
-
-    private async Task<IReadOnlyList<CatalogPackage>> GetThunderstoreCompatibleAsync(string provider, string endpoint, CancellationToken cancellationToken)
-    {
+        await _catalogReadGate.WaitAsync(cancellationToken);
+        try
+        {
+        var normalized = NormalizeThunderstoreProvider(provider);
+        var endpoint = normalized switch
+        {
+            "thunderstore" => "https://thunderstore.io/c/valheim/api/v1/package/",
+            "hexium" => "https://valheim.hexium.gg/api/v1/package/",
+            _ => throw new ProviderException("Este provedor não disponibiliza pacotes compatíveis com Thunderstore.")
+        };
         using var request = new HttpRequestMessage(HttpMethod.Get, endpoint);
-        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.3.6 (+self-hosted Valheim server manager)");
-        var response = await clients.CreateClient("catalog").SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        request.Headers.UserAgent.ParseAdd("DedicatedServerStudio/0.4.0 (+self-hosted Valheim server manager)");
+        using var response = await clients.CreateClient("catalog").SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         if (response.StatusCode == HttpStatusCode.TooManyRequests)
-            throw new ProviderException($"{(provider == "hexium" ? "Hexium" : "Thunderstore")} pediu uma pausa. Aguarde o Retry-After informado pelo provedor antes de tentar novamente.");
+            throw new ProviderException($"{(normalized == "hexium" ? "Hexium" : "Thunderstore")} pediu uma pausa. Aguarde o Retry-After informado pelo provedor antes de tentar novamente.");
         response.EnsureSuccessStatusCode();
         await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
-        var packages = await JsonSerializer.DeserializeAsync<List<ThunderstorePackage>>(stream, cancellationToken: cancellationToken) ?? [];
-        return packages.Where(package => package.IsDeprecated != true && package.Versions is { Count: > 0 })
-            .Select(package =>
-            {
-                var versions = package.Versions!;
-                var version = versions.FirstOrDefault(item => item.IsActive) ?? versions[0];
-                var allVersions = versions.Where(item => !string.IsNullOrWhiteSpace(item.VersionNumber)).Select(item =>
-                    new CatalogVersion(item.VersionNumber!, item.Description ?? package.Name, item.Icon ?? package.PakeIcon,
-                        item.DownloadUrl, item.FileSize, item.Dependencies ?? [], ParseDate(item.DateCreated), item.Downloads)).ToArray();
-                var versionDates = allVersions.Where(item => item.CreatedAt.HasValue).Select(item => item.CreatedAt!.Value).ToArray();
-                var createdAt = ParseDate(package.DateCreated) ?? (versionDates.Length > 0 ? versionDates.Min() : null);
-                var updatedAt = ParseDate(package.DateUpdated) ?? (versionDates.Length > 0 ? versionDates.Max() : null);
-                var team = package.Namespace;
-                if (string.IsNullOrWhiteSpace(team) && !string.IsNullOrWhiteSpace(package.FullName))
-                {
-                    var fullNameSeparator = package.FullName.IndexOf('-');
-                    if (fullNameSeparator > 0) team = package.FullName[..fullNameSeparator];
-                }
-                if (string.IsNullOrWhiteSpace(team)) team = package.Owner;
-                var owner = team;
-                var packageId = string.IsNullOrWhiteSpace(package.FullName) ? $"{team}-{package.Name}" : package.FullName;
-                return new CatalogPackage(provider, packageId, package.Name,
-                    owner, version.VersionNumber ?? "", version.Description ?? package.Name,
-                    version.Icon ?? package.PakeIcon, package.PackageUrl, version.DownloadUrl, version.FileSize,
-                    version.Dependencies ?? [], package.TotalDownloads > 0 ? package.TotalDownloads : versions.Sum(item => item.Downloads),
-                    updatedAt ?? ParseDate(version.DateCreated), allVersions, createdAt,
-                    ReadLong(package.RatingScore), package.Categories ?? []);
-            })
-            .OrderByDescending(item => item.Version, StringComparer.OrdinalIgnoreCase)
-            .ToArray();
+        await foreach (var package in JsonSerializer.DeserializeAsyncEnumerable<ThunderstoreCatalogPackage>(stream, cancellationToken: cancellationToken))
+            if (package is not null) yield return package;
+        }
+        finally { _catalogReadGate.Release(); }
     }
 
-    private async Task<IReadOnlyList<CatalogPackage>> GetHexiumAsync(CancellationToken cancellationToken)
+    private static CatalogPackage MapThunderstoreCatalogPackage(string provider, ThunderstoreCatalogPackage package)
     {
-        if (TryGetCached("hexium", out var cached)) return cached;
-        var result = await GetThunderstoreCompatibleAsync("hexium", "https://valheim.hexium.gg/api/v1/package/", cancellationToken);
-        SetCached("hexium", result);
-        return result;
+        var versions = package.Versions ?? [];
+        var version = versions.FirstOrDefault(item => item.IsActive) ?? versions[0];
+        var team = string.IsNullOrWhiteSpace(package.Namespace) ? package.Owner : package.Namespace;
+        if (string.IsNullOrWhiteSpace(team) && !string.IsNullOrWhiteSpace(package.FullName))
+        {
+            var separator = package.FullName.IndexOf('-');
+            if (separator > 0) team = package.FullName[..separator];
+        }
+        var packageId = string.IsNullOrWhiteSpace(package.FullName) ? $"{team}-{package.Name}" : package.FullName;
+        return new CatalogPackage(provider, packageId, package.Name, team,
+            version.VersionNumber ?? "", version.Description ?? package.Name,
+            version.Icon ?? package.PakeIcon, package.PackageUrl, version.DownloadUrl, version.FileSize,
+            version.Dependencies ?? [], package.TotalDownloads > 0 ? package.TotalDownloads : versions.Sum(item => item.Downloads),
+            ParseDate(package.DateUpdated) ?? ParseDate(version.DateCreated), [], ParseDate(package.DateCreated),
+            ReadLong(package.RatingScore), package.Categories ?? []);
     }
 
     private static string? StringProperty(JsonElement element, params string[] names)
@@ -713,19 +784,35 @@ public sealed class ProviderCatalogService(IHttpClientFactory clients, ProviderC
         return null;
     }
 
-    private bool TryGetCached(string key, out IReadOnlyList<CatalogPackage> items)
+    private sealed class ThunderstoreCatalogPackage
     {
-        if (_cache.TryGetValue(key, out var entry) && entry.ExpiresAt > DateTimeOffset.UtcNow)
-        {
-            items = entry.Items;
-            return true;
-        }
-        items = [];
-        return false;
+        [JsonPropertyName("name")] public string Name { get; set; } = "";
+        [JsonPropertyName("namespace")] public string Namespace { get; set; } = "";
+        [JsonPropertyName("owner")] public string Owner { get; set; } = "";
+        [JsonPropertyName("full_name")] public string? FullName { get; set; }
+        [JsonPropertyName("package_url")] public string? PackageUrl { get; set; }
+        [JsonPropertyName("icon")] public string? PakeIcon { get; set; }
+        [JsonPropertyName("is_deprecated")] public bool? IsDeprecated { get; set; }
+        [JsonPropertyName("total_downloads")] public long TotalDownloads { get; set; }
+        [JsonPropertyName("date_created")] public string? DateCreated { get; set; }
+        [JsonPropertyName("date_updated")] public string? DateUpdated { get; set; }
+        [JsonPropertyName("rating_score")] public JsonElement RatingScore { get; set; }
+        [JsonPropertyName("categories")] public List<string>? Categories { get; set; }
+        [JsonPropertyName("versions")] public List<ThunderstoreCatalogVersion>? Versions { get; set; }
     }
 
-    private void SetCached(string key, IReadOnlyList<CatalogPackage> items) =>
-        _cache[key] = (DateTimeOffset.UtcNow.Add(CacheLifetime), items);
+    private sealed class ThunderstoreCatalogVersion
+    {
+        [JsonPropertyName("version_number")] public string? VersionNumber { get; set; }
+        [JsonPropertyName("description")] public string? Description { get; set; }
+        [JsonPropertyName("icon")] public string? Icon { get; set; }
+        [JsonPropertyName("is_active")] public bool IsActive { get; set; }
+        [JsonPropertyName("download_url")] public string? DownloadUrl { get; set; }
+        [JsonPropertyName("file_size")] public long? FileSize { get; set; }
+        [JsonPropertyName("dependencies")] public List<string>? Dependencies { get; set; }
+        [JsonPropertyName("date_created")] public string? DateCreated { get; set; }
+        [JsonPropertyName("downloads")] public long Downloads { get; set; }
+    }
 
     private sealed class ThunderstorePackage
     {

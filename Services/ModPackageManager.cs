@@ -503,7 +503,7 @@ public sealed class ModPackageManager(StateStore state, ProviderCatalogService c
         }
     }
 
-    public async Task<(int Removed, int Preserved)> UninstallAsync(Guid instanceId, Guid modId)
+    public async Task<ModUninstallResult> UninstallAsync(Guid instanceId, Guid modId)
     {
         await _operationGate.WaitAsync();
         try
@@ -585,11 +585,12 @@ public sealed class ModPackageManager(StateStore state, ProviderCatalogService c
                 try
                 {
                     var files = await UninstallFilesCoreAsync(instanceId, mod.Id, cancellationToken);
-                    return new BatchUninstallResult(mod.Id, mod.Name, files.Removed, files.Preserved, null);
+                    return new BatchUninstallResult(mod.Id, mod.Name, files.Removed, files.Preserved, null,
+                        files.RemovedFiles, files.PreservedFiles);
                 }
                 catch (Exception ex) when (ex is ModInstallException or IOException or UnauthorizedAccessException)
                 {
-                    return new BatchUninstallResult(mod.Id, mod.Name, 0, 0, ex.Message);
+                    return new BatchUninstallResult(mod.Id, mod.Name, 0, 0, ex.Message, [], []);
                 }
             }));
 
@@ -966,7 +967,7 @@ public sealed class ModPackageManager(StateStore state, ProviderCatalogService c
             return enabled;
     }
 
-    private async Task<(int Removed, int Preserved)> UninstallCoreAsync(Guid instanceId, Guid modId)
+    private async Task<ModUninstallResult> UninstallCoreAsync(Guid instanceId, Guid modId)
     {
         var result = await UninstallFilesCoreAsync(instanceId, modId, CancellationToken.None);
         var mod = await state.ReadAsync(data => data.InstalledMods.FirstOrDefault(item => item.InstanceId == instanceId && item.Id == modId));
@@ -977,7 +978,7 @@ public sealed class ModPackageManager(StateStore state, ProviderCatalogService c
         return result;
     }
 
-    private async Task<(int Removed, int Preserved)> UninstallFilesCoreAsync(Guid instanceId, Guid modId, CancellationToken cancellationToken)
+    private async Task<ModUninstallResult> UninstallFilesCoreAsync(Guid instanceId, Guid modId, CancellationToken cancellationToken)
     {
         var mod = await state.ReadAsync(data => data.InstalledMods.FirstOrDefault(item => item.InstanceId == instanceId && item.Id == modId));
         if (mod is null) throw new ModInstallException("O pacote não está no inventário gerenciado.", HttpStatusCode.NotFound);
@@ -987,25 +988,30 @@ public sealed class ModPackageManager(StateStore state, ProviderCatalogService c
             throw new ModInstallException("A pasta do servidor não está disponível.");
         if (mod.Locked && HasManagedPayload(profile.InstallPath, mod))
             throw new ModInstallException($"{mod.Name} está bloqueado. Desbloqueie-o antes de removê-lo.", HttpStatusCode.Conflict);
-        var removed = 0;
-        var preserved = 0;
+        var removedFiles = new List<string>();
+        var preservedFiles = new List<string>();
         foreach (var relative in mod.ManagedFiles)
         {
             var path = ResolveTarget(Path.GetFullPath(profile.InstallPath), relative);
             RejectReparsePoints(Path.GetFullPath(profile.InstallPath), path);
             var disabledPath = path + ".dss-disabled";
             if (!File.Exists(path) && !File.Exists(disabledPath)) continue;
-            if (!File.Exists(path) && File.Exists(disabledPath)) path = disabledPath;
+            var displayedPath = relative.Replace('\\', '/');
+            if (!File.Exists(path) && File.Exists(disabledPath))
+            {
+                path = disabledPath;
+                displayedPath += ".dss-disabled";
+            }
             var expected = FindTrackedHash(mod, relative);
             if (string.IsNullOrWhiteSpace(expected) || !string.Equals(expected, await HashFileAsync(path, cancellationToken), StringComparison.OrdinalIgnoreCase))
             {
-                preserved++;
+                preservedFiles.Add(displayedPath);
                 continue;
             }
             File.Delete(path);
-            removed++;
+            removedFiles.Add(displayedPath);
         }
-        return (removed, preserved);
+        return new ModUninstallResult(removedFiles, preservedFiles);
     }
 
     private static void PruneEmptyManagedDirectories(string installRoot, IEnumerable<string> managedFiles)
@@ -1247,4 +1253,11 @@ public sealed class ModInstallException(string message, HttpStatusCode statusCod
 public sealed record ModBatchProgress(string Phase, string PackageId, string PackageName, int Index, int Total,
     long DownloadedBytes, long? TotalBytes);
 
-public sealed record BatchUninstallResult(Guid ModId, string Name, int Removed, int Preserved, string? Error);
+public sealed record ModUninstallResult(IReadOnlyList<string> RemovedFiles, IReadOnlyList<string> PreservedFiles)
+{
+    public int Removed => RemovedFiles.Count;
+    public int Preserved => PreservedFiles.Count;
+}
+
+public sealed record BatchUninstallResult(Guid ModId, string Name, int Removed, int Preserved, string? Error,
+    IReadOnlyList<string> RemovedFiles, IReadOnlyList<string> PreservedFiles);

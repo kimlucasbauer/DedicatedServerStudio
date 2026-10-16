@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using DedicatedServerStudio.Models;
 
@@ -14,10 +15,12 @@ public sealed class PlayerManagementService
     private static readonly Regex PlayFabConnection = new(@"Got connection PlayFab(?:ID| ID)?\s+(?<id>[A-Za-z0-9_:-]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex CharacterSpawn = new(@"Got character ZDOID from\s+(?<name>.+?)\s*:\s*-?\d+\s*:\s*-?\d+", RegexOptions.IgnoreCase | RegexOptions.Compiled);
     private static readonly Regex SocketClosed = new(@"Closing socket\s+(?<id>[A-Za-z0-9_:-]+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    private const int MaxCachedServerLogs = 4;
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _fileLocks = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, CachedLog> _logCache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly JsonSerializerOptions HistoryJsonOptions = new() { WriteIndented = true };
 
-    public async Task<PlayerManagementSnapshot> GetAsync(ServerProfile profile, string saveDirectory, string logPath,
+    public async Task<PlayerManagementSnapshot> GetAsync(ServerProfile profile, string saveDirectory, string logPath, string historyPath,
         bool running, CancellationToken cancellationToken)
     {
         var admins = await ReadListAsync(saveDirectory, "adminlist.txt", cancellationToken);
@@ -30,14 +33,25 @@ public sealed class PlayerManagementService
         var all = new Dictionary<string, PlayerManagementPlayer>(StringComparer.OrdinalIgnoreCase);
         var adminSet = admins.ToHashSet(StringComparer.Ordinal);
         var banSet = bans.ToHashSet(StringComparer.Ordinal);
+        foreach (var player in await ReadPlayerHistoryAsync(historyPath, cancellationToken))
+        {
+            if (string.IsNullOrWhiteSpace(player.UserId) && string.IsNullOrWhiteSpace(player.Name)) continue;
+            var userId = string.IsNullOrWhiteSpace(player.UserId) ? null : player.UserId;
+            var name = string.IsNullOrWhiteSpace(player.Name) ? userId ?? "Jogador sem nome" : player.Name.Trim();
+            all[PlayerKey(userId, name)] = new PlayerManagementPlayer(userId, name, false, 0, player.TotalSeconds,
+                player.LastSeenAt, userId is not null && adminSet.Contains(userId),
+                userId is not null && banSet.Contains(userId), userId is not null && permitted.Contains(userId, StringComparer.Ordinal));
+        }
         foreach (var record in records.Values)
         {
             var active = running && record.ActiveSince.HasValue;
             var session = active ? Math.Max(0, (DateTimeOffset.UtcNow - record.ActiveSince!.Value).TotalSeconds) : 0;
             var userId = record.UserId;
-            var name = string.IsNullOrWhiteSpace(record.Name) ? userId ?? "Jogador sem nome" : record.Name.Trim();
-            all[PlayerKey(userId, name)] = new PlayerManagementPlayer(userId, name, active, session,
-                record.TotalSeconds + session, record.LastSeenAt, userId is not null && adminSet.Contains(userId),
+            var key = PlayerKey(userId, string.IsNullOrWhiteSpace(record.Name) ? userId ?? "Jogador sem nome" : record.Name.Trim());
+            all.TryGetValue(key, out var previous);
+            var name = string.IsNullOrWhiteSpace(record.Name) ? previous?.Name ?? userId ?? "Jogador sem nome" : record.Name.Trim();
+            all[key] = new PlayerManagementPlayer(userId, name, active, session,
+                Math.Max(previous?.TotalSeconds ?? 0, record.TotalSeconds + session), Max(previous?.LastSeenAt, record.LastSeenAt), userId is not null && adminSet.Contains(userId),
                 userId is not null && banSet.Contains(userId), userId is not null && permitted.Contains(userId, StringComparer.Ordinal));
         }
 
@@ -85,6 +99,8 @@ public sealed class PlayerManagementService
             all[PlayerKey(id, id)] = new PlayerManagementPlayer(id, id, false, 0, 0, null,
                 adminSet.Contains(id), banSet.Contains(id), permitted.Contains(id, StringComparer.Ordinal));
         }
+
+        await SavePlayerHistoryAsync(historyPath, all.Values, cancellationToken);
 
         var trackedCount = records.Values.Count(record => record.ActiveSince.HasValue);
         int? activeCount = !running ? 0 : query?.PlayerCount ?? (trackedCount > 0 ? trackedCount : null);
@@ -151,6 +167,93 @@ public sealed class PlayerManagementService
         finally { gate.Release(); }
     }
 
+    public async Task<bool> CanQueryServerAsync(IPAddress address, int port, CancellationToken cancellationToken)
+    {
+        if (port is < 1 or > 65535) return false;
+        try
+        {
+            using var client = new UdpClient(address.AddressFamily);
+            client.Connect(address, port);
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeout.CancelAfter(TimeSpan.FromMilliseconds(900));
+            var request = new byte[] { 0xff, 0xff, 0xff, 0xff, 0x54, (byte)'S', (byte)'o', (byte)'u', (byte)'r', (byte)'c', (byte)'e', (byte)' ', (byte)'E', (byte)'n', (byte)'g', (byte)'i', (byte)'n', (byte)'e', (byte)' ', (byte)'Q', (byte)'u', (byte)'e', (byte)'r', (byte)'y', 0 };
+            var response = await SendInfoQueryAsync(client, request, timeout.Token);
+            return response.Buffer.Length >= 6 && response.Buffer[4] == 0x49;
+        }
+        catch (Exception ex) when (ex is SocketException or OperationCanceledException or InvalidOperationException or ArgumentException)
+        {
+            return false;
+        }
+    }
+
+    private async Task<IReadOnlyList<StoredPlayerHistory>> ReadPlayerHistoryAsync(string path, CancellationToken token)
+    {
+        var gate = _fileLocks.GetOrAdd(Path.GetFullPath(path), _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(token);
+        try
+        {
+            if (!File.Exists(path)) return [];
+            try
+            {
+                await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
+                    16 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                return await JsonSerializer.DeserializeAsync<List<StoredPlayerHistory>>(stream, HistoryJsonOptions, token) ?? [];
+            }
+            catch (JsonException) { return []; }
+            catch (IOException) { return []; }
+        }
+        finally { gate.Release(); }
+    }
+
+    private async Task SavePlayerHistoryAsync(string path, IEnumerable<PlayerManagementPlayer> players, CancellationToken token)
+    {
+        var gate = _fileLocks.GetOrAdd(Path.GetFullPath(path), _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(token);
+        try
+        {
+            var history = players
+                .Where(player => !string.IsNullOrWhiteSpace(player.UserId) || !string.IsNullOrWhiteSpace(player.Name))
+                .GroupBy(player => PlayerKey(player.UserId, player.Name), StringComparer.OrdinalIgnoreCase)
+                .Select(group => group.OrderByDescending(player => player.TotalSeconds).First())
+                .OrderBy(player => PlayerKey(player.UserId, player.Name), StringComparer.OrdinalIgnoreCase)
+                .Select(player => new StoredPlayerHistory(player.UserId, player.Name, Math.Max(0, player.TotalSeconds),
+                    player.LastSeenAt, player.IsActive))
+                .ToArray();
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+            var temporary = path + ".dss.tmp";
+            await using (var stream = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None,
+                16 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan))
+            {
+                await JsonSerializer.SerializeAsync(stream, history, HistoryJsonOptions, token);
+                await stream.FlushAsync(token);
+            }
+            if (File.Exists(path) && await FilesEqualAsync(path, temporary, token)) { File.Delete(temporary); return; }
+            File.Move(temporary, path, true);
+        }
+        catch (IOException) { }
+        finally { gate.Release(); }
+    }
+
+    private static async Task<bool> FilesEqualAsync(string leftPath, string rightPath, CancellationToken token)
+    {
+        var leftInfo = new FileInfo(leftPath);
+        var rightInfo = new FileInfo(rightPath);
+        if (leftInfo.Length != rightInfo.Length) return false;
+        await using var left = new FileStream(leftPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
+            16 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        await using var right = new FileStream(rightPath, FileMode.Open, FileAccess.Read, FileShare.Read,
+            16 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+        var leftBuffer = new byte[16 * 1024];
+        var rightBuffer = new byte[leftBuffer.Length];
+        while (true)
+        {
+            var leftRead = await left.ReadAsync(leftBuffer, token);
+            var rightRead = await right.ReadAsync(rightBuffer, token);
+            if (leftRead != rightRead || !leftBuffer.AsSpan(0, leftRead).SequenceEqual(rightBuffer.AsSpan(0, rightRead))) return false;
+            if (leftRead == 0) return true;
+        }
+    }
+
     private async Task RemoveIdAsync(string root, string fileName, string userId, CancellationToken cancellationToken)
     {
         var path = Path.Combine(root, fileName);
@@ -190,62 +293,73 @@ public sealed class PlayerManagementService
         catch (IOException) { return new Dictionary<string, LogPlayer>(StringComparer.OrdinalIgnoreCase); }
         if (_logCache.TryGetValue(path, out var cached) && cached.Length == length && cached.LastWriteUtc == lastWrite)
             return cached.Players;
-        string[] lines;
-        try { lines = await File.ReadAllLinesAsync(path, token); }
-        catch (IOException) { return new Dictionary<string, LogPlayer>(StringComparer.OrdinalIgnoreCase); }
         var players = new Dictionary<string, LogPlayer>(StringComparer.OrdinalIgnoreCase);
         var open = new Dictionary<string, (LogPlayer Player, DateTimeOffset Started)>(StringComparer.OrdinalIgnoreCase);
-        foreach (var line in lines)
+        try
         {
-            var (timestamp, message) = ParseLogLine(line);
-            var connection = SteamConnection.Match(message);
-            if (!connection.Success) connection = PlayFabConnection.Match(message);
-            if (connection.Success)
+            await using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
+                64 * 1024, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, 64 * 1024, leaveOpen: false);
+            while (await reader.ReadLineAsync(token) is { } line)
             {
-                var id = connection.Groups["id"].Value;
-                if (open.TryGetValue(id, out var previous)) Close(previous.Player, previous.Started, timestamp);
-                if (!players.TryGetValue(id, out var player)) players[id] = player = new LogPlayer(id);
-                player.LastSeenAt = timestamp;
-                open[id] = (player, timestamp);
-                player.ActiveSince = timestamp;
-                continue;
-            }
-            var spawn = CharacterSpawn.Match(message);
-            if (spawn.Success)
-            {
-                var name = spawn.Groups["name"].Value.Trim();
-                var candidate = open.Where(entry => string.IsNullOrEmpty(entry.Value.Player.Name) &&
-                        timestamp - entry.Value.Started <= TimeSpan.FromMinutes(5))
-                    .OrderByDescending(entry => entry.Value.Started).FirstOrDefault();
-                if (!string.IsNullOrEmpty(candidate.Key))
+                token.ThrowIfCancellationRequested();
+                var (timestamp, message) = ParseLogLine(line);
+                var connection = SteamConnection.Match(message);
+                if (!connection.Success) connection = PlayFabConnection.Match(message);
+                if (connection.Success)
                 {
-                    candidate.Value.Player.Name = name;
-                    candidate.Value.Player.LastSeenAt = timestamp;
-                }
-                else
-                {
-                    var nameKey = "name:" + name;
-                    if (!players.TryGetValue(nameKey, out var player)) players[nameKey] = player = new LogPlayer(null);
-                    player.Name = name;
+                    var id = connection.Groups["id"].Value;
+                    if (open.TryGetValue(id, out var previous)) Close(previous.Player, previous.Started, timestamp);
+                    if (!players.TryGetValue(id, out var player)) players[id] = player = new LogPlayer(id);
                     player.LastSeenAt = timestamp;
+                    open[id] = (player, timestamp);
+                    player.ActiveSince = timestamp;
+                    continue;
                 }
-                continue;
-            }
-            var close = SocketClosed.Match(message);
-            if (close.Success && open.Remove(close.Groups["id"].Value, out var session))
-            {
-                Close(session.Player, session.Started, timestamp);
-                continue;
-            }
-            if (message.Contains("Server process exited", StringComparison.OrdinalIgnoreCase))
-            {
-                foreach (var activeSession in open.Values) Close(activeSession.Player, activeSession.Started, timestamp);
-                open.Clear();
+                var spawn = CharacterSpawn.Match(message);
+                if (spawn.Success)
+                {
+                    var name = spawn.Groups["name"].Value.Trim();
+                    var candidate = open.Where(entry => string.IsNullOrEmpty(entry.Value.Player.Name) &&
+                            timestamp - entry.Value.Started <= TimeSpan.FromMinutes(5))
+                        .OrderByDescending(entry => entry.Value.Started).FirstOrDefault();
+                    if (!string.IsNullOrEmpty(candidate.Key))
+                    {
+                        candidate.Value.Player.Name = name;
+                        candidate.Value.Player.LastSeenAt = timestamp;
+                    }
+                    else
+                    {
+                        var nameKey = "name:" + name;
+                        if (!players.TryGetValue(nameKey, out var player)) players[nameKey] = player = new LogPlayer(null);
+                        player.Name = name;
+                        player.LastSeenAt = timestamp;
+                    }
+                    continue;
+                }
+                var close = SocketClosed.Match(message);
+                if (close.Success && open.Remove(close.Groups["id"].Value, out var session))
+                {
+                    Close(session.Player, session.Started, timestamp);
+                    continue;
+                }
+                if (message.Contains("Server process exited", StringComparison.OrdinalIgnoreCase))
+                {
+                    foreach (var activeSession in open.Values) Close(activeSession.Player, activeSession.Started, timestamp);
+                    open.Clear();
+                }
             }
         }
+        catch (IOException) { return new Dictionary<string, LogPlayer>(StringComparer.OrdinalIgnoreCase); }
         foreach (var session in open.Values) session.Player.ActiveSince = session.Started;
         var snapshot = players.ToDictionary(pair => pair.Key, pair => pair.Value.Clone(), StringComparer.OrdinalIgnoreCase);
         _logCache[path] = new CachedLog(length, lastWrite, snapshot);
+        if (_logCache.Count > MaxCachedServerLogs)
+        {
+            foreach (var entry in _logCache.Where(entry => !entry.Key.Equals(path, StringComparison.OrdinalIgnoreCase))
+                         .OrderBy(entry => entry.Value.LastWriteUtc).Take(_logCache.Count - MaxCachedServerLogs))
+                _logCache.TryRemove(entry.Key, out _);
+        }
         return snapshot;
     }
 
@@ -400,6 +514,7 @@ public sealed class PlayerManagementService
     }
 
     private sealed record CachedLog(long Length, DateTime LastWriteUtc, IReadOnlyDictionary<string, LogPlayer> Players);
+    private sealed record StoredPlayerHistory(string? UserId, string Name, double TotalSeconds, DateTimeOffset? LastSeenAt, bool WasActive);
     private sealed record ServerQuery(int PlayerCount, IReadOnlyList<QueryPlayer>? Players, bool Available);
     private sealed record QueryPlayer(string Name, double DurationSeconds);
     private sealed class LogPlayer(string? id)

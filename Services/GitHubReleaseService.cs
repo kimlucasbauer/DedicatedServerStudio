@@ -41,7 +41,7 @@ public sealed class GitHubReleaseService(HttpClient client)
         var tag = ReadString(root, "tag_name");
         if (string.IsNullOrWhiteSpace(tag)) throw new InvalidDataException("A release mais recente não contém uma tag de versão.");
         var latestVersion = NormalizeVersion(tag);
-        if (!Version.TryParse(latestVersion, out var latest)) throw new InvalidDataException("A tag da release não usa uma versão válida, como v0.3.6.");
+        if (!Version.TryParse(latestVersion, out var latest)) throw new InvalidDataException("A tag da release não usa uma versão válida, como v0.4.0.");
         if (!Version.TryParse(CurrentVersion, out var current)) throw new InvalidOperationException("A versão atual do DSS não pôde ser identificada.");
 
         var expectedAsset = $"DedicatedServerStudio-{latest.ToString(3)}-production.zip";

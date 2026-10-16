@@ -7,13 +7,18 @@
     <AssemblyName>DedicatedServerStudio</AssemblyName>
     <RootNamespace>DedicatedServerStudio</RootNamespace>
     <Product>Dedicated Server Studio</Product>
-    <Version>0.3.6</Version>
+    <Version>0.4.0</Version>
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- DSS runs alongside dedicated game servers; prefer a smaller managed heap over throughput. -->
+    <RuntimeHostConfigurationOption Include="System.GC.ConserveMemory" Value="6" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- The Vite build emits the only frontend artifacts DSS serves. Keep React sources out of the web package. -->
-    <Content Remove="frontend\**;publish\**;release\**" />
-    <None Remove="frontend\**;publish\**;release\**" />
+    <Content Remove="frontend\**;publish\**;release\**;dss-config.json" />
+    <None Remove="frontend\**;publish\**;release\**;dss-config.json" />
   </ItemGroup>
 
 </Project>

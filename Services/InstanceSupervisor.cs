@@ -302,23 +302,14 @@ public sealed class InstanceSupervisor(StateStore state, GameAdapterRegistry ada
         }
     }
 
-    public long GetProfileStorageBytes(ServerProfile profile)
+    public long GetSaveDirectoryBytes(ServerProfile profile)
     {
         var now = Stopwatch.GetTimestamp();
-        if (_storageUsageCache.TryGetValue(profile.Id, out var cached) && Stopwatch.GetElapsedTime(cached.SampledAt, now) < TimeSpan.FromSeconds(30))
+        if (_storageUsageCache.TryGetValue(profile.Id, out var cached) && Stopwatch.GetElapsedTime(cached.SampledAt, now) < TimeSpan.FromSeconds(10))
             return cached.Bytes;
 
-        long bytes = 0;
         var saveDirectory = Path.GetFullPath(SavePathResolver.Resolve(profile, state.DataDirectory));
-        var instanceDirectory = Path.GetFullPath(InstanceDirectory(profile.Id));
-        bytes = SaturatingAdd(bytes, DirectorySize(instanceDirectory));
-        if (!IsPathWithin(instanceDirectory, saveDirectory))
-        {
-            var sharedInstallSaves = profile.UseInstallPathSaves;
-            bytes = SaturatingAdd(bytes, sharedInstallSaves
-                ? WorldSaveSize(saveDirectory, profile.WorldName)
-                : DirectorySize(saveDirectory));
-        }
+        var bytes = DirectorySize(saveDirectory);
         _storageUsageCache[profile.Id] = (now, bytes);
         return bytes;
     }
@@ -337,7 +328,7 @@ public sealed class InstanceSupervisor(StateStore state, GameAdapterRegistry ada
         var bridgeStart = new ProcessStartInfo
         {
             FileName = hostPath,
-            WorkingDirectory = AppContext.BaseDirectory,
+            WorkingDirectory = state.ContentRootPath,
             UseShellExecute = false,
             CreateNoWindow = true
         };
@@ -381,17 +372,28 @@ public sealed class InstanceSupervisor(StateStore state, GameAdapterRegistry ada
         {
             await process.Process.WaitForExitAsync();
             AppendLog(id, logPath, "manager", $"Server process exited with code {process.Process.ExitCode}.");
+            if (_logs.TryGetValue(id, out var buffer)) _ = RetireConsoleBufferAsync(id, buffer);
         }
         catch (InvalidOperationException) { }
+    }
+
+    private async Task RetireConsoleBufferAsync(Guid id, ConsoleLogBuffer buffer)
+    {
+        await Task.Delay(TimeSpan.FromMinutes(2));
+        ((ICollection<KeyValuePair<Guid, ConsoleLogBuffer>>)_logs)
+            .Remove(new KeyValuePair<Guid, ConsoleLogBuffer>(id, buffer));
     }
 
     private sealed class ConsoleLogBuffer
     {
         private const int MaxVisibleLines = 1000;
+        private const int MaxVisibleCharacters = 1_000_000;
+        private const int MaxLineCharacters = 4096;
         private readonly object _gate = new();
         private readonly Queue<ConsoleLogEntry> _entries = new();
         private long _sequence;
         private long _filePosition;
+        private int _visibleCharacters;
 
         public ConsoleLogBuffer(string path)
         {
@@ -406,7 +408,7 @@ public sealed class InstanceSupervisor(StateStore state, GameAdapterRegistry ada
                     recent.Enqueue(line);
                     while (recent.Count > MaxVisibleLines) recent.Dequeue();
                 }
-                foreach (var line in recent) _entries.Enqueue(new(++_sequence, DateTimeOffset.Now, "history", line));
+                foreach (var line in recent) AddEntry("history", line, DateTimeOffset.Now);
                 _filePosition = stream.Position;
             }
             catch (IOException) { }
@@ -419,8 +421,7 @@ public sealed class InstanceSupervisor(StateStore state, GameAdapterRegistry ada
                 var timestamp = DateTimeOffset.Now;
                 try { File.AppendAllText(path, $"[{timestamp:O}] {text}{Environment.NewLine}"); }
                 catch (IOException) { }
-                _entries.Enqueue(new(++_sequence, timestamp, stream, text));
-                while (_entries.Count > MaxVisibleLines) _entries.Dequeue();
+                AddEntry(stream, text, timestamp);
                 try { _filePosition = new FileInfo(path).Length; } catch (IOException) { }
             }
         }
@@ -438,8 +439,7 @@ public sealed class InstanceSupervisor(StateStore state, GameAdapterRegistry ada
                     using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: false, leaveOpen: true);
                     while (reader.ReadLine() is { } line)
                     {
-                        _entries.Enqueue(new(++_sequence, DateTimeOffset.Now, "server", line));
-                        while (_entries.Count > MaxVisibleLines) _entries.Dequeue();
+                        AddEntry("server", line, DateTimeOffset.Now);
                     }
                     _filePosition = stream.Position;
                 }
@@ -451,6 +451,16 @@ public sealed class InstanceSupervisor(StateStore state, GameAdapterRegistry ada
         {
             lock (_gate)
                 return (_entries.Where(entry => entry.Sequence > afterSequence).TakeLast(count).ToArray(), _sequence);
+        }
+
+        private void AddEntry(string stream, string text, DateTimeOffset timestamp)
+        {
+            var bounded = text.Length > MaxLineCharacters ? text[^MaxLineCharacters..] : text;
+            var entry = new ConsoleLogEntry(++_sequence, timestamp, stream, bounded);
+            _entries.Enqueue(entry);
+            _visibleCharacters += bounded.Length;
+            while (_entries.Count > MaxVisibleLines || _visibleCharacters > MaxVisibleCharacters)
+                _visibleCharacters -= _entries.Dequeue().Text.Length;
         }
     }
 
@@ -475,7 +485,13 @@ public sealed class InstanceSupervisor(StateStore state, GameAdapterRegistry ada
             {
                 foreach (var file in Directory.EnumerateFiles(path))
                 {
-                    try { total = SaturatingAdd(total, new FileInfo(file).Length); } catch (IOException) { }
+                    try
+                    {
+                        var info = new FileInfo(file);
+                        if ((info.Attributes & FileAttributes.ReparsePoint) == 0)
+                            total = SaturatingAdd(total, info.Length);
+                    }
+                    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
                 }
                 foreach (var directory in Directory.EnumerateDirectories(path))
                 {
@@ -485,43 +501,6 @@ public sealed class InstanceSupervisor(StateStore state, GameAdapterRegistry ada
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         }
         return total;
-    }
-
-    private static long WorldSaveSize(string root, string worldName)
-    {
-        if (!Directory.Exists(root) || string.IsNullOrWhiteSpace(worldName)) return 0;
-        long total = 0;
-        var pending = new Stack<string>();
-        pending.Push(root);
-        while (pending.Count > 0)
-        {
-            var path = pending.Pop();
-            try
-            {
-                foreach (var file in Directory.EnumerateFiles(path))
-                {
-                    var name = Path.GetFileName(file);
-                    if (!name.StartsWith(worldName + ".", StringComparison.OrdinalIgnoreCase) &&
-                        !name.StartsWith(worldName + "_", StringComparison.OrdinalIgnoreCase) &&
-                        !string.Equals(name, worldName, StringComparison.OrdinalIgnoreCase))
-                        continue;
-                    try { total = SaturatingAdd(total, new FileInfo(file).Length); } catch (IOException) { }
-                }
-                foreach (var directory in Directory.EnumerateDirectories(path))
-                {
-                    try { if ((File.GetAttributes(directory) & FileAttributes.ReparsePoint) == 0) pending.Push(directory); } catch (IOException) { }
-                }
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
-        }
-        return total;
-    }
-
-    private static bool IsPathWithin(string parent, string candidate)
-    {
-        var prefix = parent.EndsWith(Path.DirectorySeparatorChar) ? parent : parent + Path.DirectorySeparatorChar;
-        return string.Equals(parent, candidate, StringComparison.OrdinalIgnoreCase) ||
-            candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 
     private static Dictionary<int, int> GetUdpPortOwners()

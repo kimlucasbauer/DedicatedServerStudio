@@ -20,8 +20,7 @@ $backupReady = $false
 $restartStarted = $false
 $archiveHandle = $null
 $allowedFiles = @(
-    'appsettings.json', 'DedicatedServerStudio.dll', 'DedicatedServerStudio.deps.json',
-    'DedicatedServerStudio.runtimeconfig.json', 'DedicatedServerStudio.staticwebassets.endpoints.json',
+    'appsettings.json', 'DedicatedServerStudio.staticwebassets.endpoints.json',
     'dss-runtime.json', 'DSS.cmd', 'run.ps1', 'apply-update.ps1', 'README.md', 'LICENSE', 'web.config'
 )
 
@@ -108,6 +107,23 @@ try {
     $assemblyHash = (Get-FileHash -LiteralPath (Join-Path $extract 'DedicatedServerStudio.dll') -Algorithm SHA256).Hash
     if (-not $assemblyHash.Equals([string]$runtime.sha256, [StringComparison]::OrdinalIgnoreCase)) { throw 'The release assembly does not match its runtime manifest.' }
 
+    # Keep every build immutable so a detached console bridge can continue loading the
+    # exact assembly and dependency files it started with while the panel is replaced.
+    $safeVersion = $ExpectedVersion -replace '[^0-9A-Za-z.-]', '_'
+    $buildDirectoryName = '.dss-builds\' + $safeVersion + '-' + [Guid]::NewGuid().ToString('N')
+    $buildDirectory = Join-Path $root $buildDirectoryName
+    New-Item -ItemType Directory -Path $buildDirectory -Force | Out-Null
+    foreach ($name in @('DedicatedServerStudio.dll', 'DedicatedServerStudio.deps.json', 'DedicatedServerStudio.runtimeconfig.json')) {
+        Copy-Item -LiteralPath (Join-Path $extract $name) -Destination (Join-Path $buildDirectory $name) -Force
+    }
+    $newRuntimeManifest = @{
+        assemblyPath = ($buildDirectoryName.Replace([IO.Path]::DirectorySeparatorChar, '/') + '/DedicatedServerStudio.dll')
+        sha256 = $assemblyHash
+        builtAt = [string]$runtime.builtAt
+    }
+    $runtimeManifestPath = Join-Path $work 'dss-runtime.json'
+    [IO.File]::WriteAllText($runtimeManifestPath, ($newRuntimeManifest | ConvertTo-Json -Depth 3), [Text.UTF8Encoding]::new($false))
+
     $existingFiles = @($allowedFiles | Where-Object { Test-Path -LiteralPath (Join-Path $root $_) -PathType Leaf })
     if (Test-Path -LiteralPath (Join-Path $root 'wwwroot') -PathType Container) {
         Copy-Item -LiteralPath (Join-Path $root 'wwwroot') -Destination (Join-Path $backup 'wwwroot') -Recurse -Force
@@ -117,9 +133,11 @@ try {
     $backupReady = $true
 
     foreach ($name in $allowedFiles) {
+        if ($name -eq 'dss-runtime.json') { continue }
         $source = Join-Path $extract $name
         if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Item -LiteralPath $source -Destination (Join-Path $root $name) -Force }
     }
+    Move-Item -LiteralPath $runtimeManifestPath -Destination (Join-Path $root 'dss-runtime.json') -Force
     $oldWebRoot = Join-Path $root 'wwwroot'
     if (Test-Path -LiteralPath $oldWebRoot) { Remove-Item -LiteralPath $oldWebRoot -Recurse -Force }
     Copy-Item -LiteralPath (Join-Path $extract 'wwwroot') -Destination $oldWebRoot -Recurse -Force

@@ -19,6 +19,21 @@ $logWriteFailed = $false
 $exitCode = 1
 $script:startupSignalPath = $StartupSignalPath
 
+function Resolve-DssAssembly([string]$ConfiguredPath, [string]$ExpectedHash) {
+    if ([string]::IsNullOrWhiteSpace($ConfiguredPath) -or [IO.Path]::IsPathRooted($ConfiguredPath)) {
+        throw 'The active build path in dss-runtime.json must be relative to the DSS project folder.'
+    }
+    $resolvedPath = [IO.Path]::GetFullPath((Join-Path $projectRoot $ConfiguredPath))
+    $rootPrefix = [IO.Path]::GetFullPath($projectRoot).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    if (-not $resolvedPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The active build path resolves outside the DSS project folder.'
+    }
+    if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) { throw "The active DSS build is missing: $resolvedPath" }
+    $actualHash = (Get-FileHash -LiteralPath $resolvedPath -Algorithm SHA256).Hash
+    if ($actualHash -ne $ExpectedHash) { throw 'The active build was replaced. Restore the build listed in dss-runtime.json or select a newly approved build.' }
+    return $resolvedPath
+}
+
 function Write-StartupSignal([bool]$Ready, [bool]$IsAdministrator, [string]$Message = '') {
     if ([string]::IsNullOrWhiteSpace($script:startupSignalPath)) { return }
     $signalPath = $script:startupSignalPath
@@ -66,6 +81,10 @@ try {
         }
         catch { throw "The DSS configuration in dss-config.json is invalid: $($_.Exception.Message)" }
     }
+    else {
+        $defaultConfig = [ordered]@{ runAsAdministrator = $false; listenMode = 'local' }
+        [IO.File]::WriteAllText($dssConfigPath, ($defaultConfig | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
+    }
 
     if ($Public) { $ListenMode = 'public' }
     elseif ($Lan) { $ListenMode = 'lan' }
@@ -101,10 +120,7 @@ try {
         if ([string]::IsNullOrWhiteSpace($AssemblyPath)) {
             $runtimeFile = Join-Path $projectRoot 'dss-runtime.json'
             $runtime = Get-Content -LiteralPath $runtimeFile -Raw | ConvertFrom-Json
-            $AssemblyPath = Join-Path $projectRoot $runtime.assemblyPath
-            if (-not (Test-Path -LiteralPath $AssemblyPath -PathType Leaf)) { throw "The active DSS build is missing: $AssemblyPath" }
-            $actualHash = (Get-FileHash -LiteralPath $AssemblyPath -Algorithm SHA256).Hash
-            if ($actualHash -ne $runtime.sha256) { throw 'The active build was replaced. Restore the build listed in dss-runtime.json or select a newly approved build.' }
+            $AssemblyPath = Resolve-DssAssembly ([string]$runtime.assemblyPath) ([string]$runtime.sha256)
         }
         elseif (-not [IO.Path]::IsPathRooted($AssemblyPath)) { $AssemblyPath = Join-Path $projectRoot $AssemblyPath }
         if (-not (Test-Path -LiteralPath $AssemblyPath -PathType Leaf)) { throw "DSS assembly was not found: $AssemblyPath" }
@@ -117,10 +133,7 @@ try {
             if ([string]::IsNullOrWhiteSpace($AssemblyPath)) {
                 $runtimeFile = Join-Path $projectRoot 'dss-runtime.json'
                 $runtime = Get-Content -LiteralPath $runtimeFile -Raw | ConvertFrom-Json
-                $AssemblyPath = Join-Path $projectRoot $runtime.assemblyPath
-                if (-not (Test-Path -LiteralPath $AssemblyPath -PathType Leaf)) { throw "The active DSS build is missing: $AssemblyPath" }
-                $actualHash = (Get-FileHash -LiteralPath $AssemblyPath -Algorithm SHA256).Hash
-                if ($actualHash -ne $runtime.sha256) { throw 'The active build was replaced. Restore the build listed in dss-runtime.json or select a newly approved build.' }
+                $AssemblyPath = Resolve-DssAssembly ([string]$runtime.assemblyPath) ([string]$runtime.sha256)
             }
             elseif (-not [IO.Path]::IsPathRooted($AssemblyPath)) { $AssemblyPath = Join-Path $projectRoot $AssemblyPath }
             if (-not (Test-Path -LiteralPath $AssemblyPath -PathType Leaf)) { throw "DSS assembly was not found: $AssemblyPath" }
@@ -200,10 +213,7 @@ try {
     if ([string]::IsNullOrWhiteSpace($AssemblyPath)) {
         $runtimeFile = Join-Path $projectRoot 'dss-runtime.json'
         $runtime = Get-Content -LiteralPath $runtimeFile -Raw | ConvertFrom-Json
-        $AssemblyPath = Join-Path $projectRoot $runtime.assemblyPath
-        if (-not (Test-Path -LiteralPath $AssemblyPath -PathType Leaf)) { throw "The active DSS build is missing: $AssemblyPath" }
-        $actualHash = (Get-FileHash -LiteralPath $AssemblyPath -Algorithm SHA256).Hash
-        if ($actualHash -ne $runtime.sha256) { throw 'The active build was replaced. Restore the build listed in dss-runtime.json or select a newly approved build.' }
+        $AssemblyPath = Resolve-DssAssembly ([string]$runtime.assemblyPath) ([string]$runtime.sha256)
     }
     elseif (-not [IO.Path]::IsPathRooted($AssemblyPath)) { $AssemblyPath = Join-Path $projectRoot $AssemblyPath }
     if (-not (Test-Path -LiteralPath $AssemblyPath -PathType Leaf)) { throw "DSS assembly was not found: $AssemblyPath" }
