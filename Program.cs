@@ -197,7 +197,8 @@ var r2modmanProfiles = app.Services.GetRequiredService<R2ModmanProfileService>()
 var githubReleases = app.Services.GetRequiredService<GitHubReleaseService>();
 
 var elevationStartupId = Guid.NewGuid().ToString("N");
-app.MapGet("/api/health", () => Results.Ok(new { status = "ready", app = "Dedicated Server Studio", shortName = "DSS", version = "0.4.2", startupId = elevationStartupId }));
+var appVersion = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0";
+app.MapGet("/api/health", () => Results.Ok(new { status = "ready", app = "Dedicated Server Studio", shortName = "DSS", version = appVersion, startupId = elevationStartupId }));
 
 app.MapGet("/api/app/elevation/status", (HttpContext context) =>
 {

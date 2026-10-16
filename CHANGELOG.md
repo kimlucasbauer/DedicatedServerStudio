@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.4 — 2026-10-16
+
+### Fixed
+
+- Report the version from the running assembly in `/api/health`, allowing staged update checks to confirm the downloaded version before replacing the active installation.
+
 ## 0.4.3 — 2026-10-16
 
 ### Added
