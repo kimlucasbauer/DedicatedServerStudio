@@ -11,6 +11,12 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# The launcher may inherit a PowerShell 7 module path. Load the Windows PowerShell
+# modules by their host paths so update, process, and port commands remain available.
+foreach ($moduleName in @('Microsoft.PowerShell.Utility', 'CimCmdlets', 'NetTCPIP')) {
+    $moduleManifest = Join-Path (Join-Path (Join-Path $PSHOME 'Modules') $moduleName) ($moduleName + '.psd1')
+    Import-Module $moduleManifest -ErrorAction Stop
+}
 $root = [IO.Path]::GetFullPath($ProjectRoot).TrimEnd([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
 $archive = [IO.Path]::GetFullPath($ArchivePath)
 $work = Join-Path $root ('.dss-update-work-' + [Guid]::NewGuid().ToString('N'))
@@ -122,7 +128,8 @@ function Wait-ForStoppedDssLauncher {
         return
     }
 
-    $deadline = (Get-Date).AddSeconds(8)
+    Write-UpdateProgress 'stopping-launcher' 84 'Liberando o inicializador anterior'
+    $deadline = (Get-Date).AddSeconds(2)
     while ((Get-Date) -lt $deadline -and (Test-DssLauncherIdentity $CurrentLauncherProcessId)) {
         Start-Sleep -Milliseconds 150
     }
@@ -133,7 +140,6 @@ function Wait-ForStoppedDssLauncher {
     $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($listener) { throw "Port $Port became active again before the old launcher released its lock." }
     Write-UpdateLog "The stopped DSS host's verified launcher $CurrentLauncherProcessId still holds the startup lock; closing the wrapper before restart."
-    Write-UpdateProgress 'stopping-launcher' 84 'Liberando o inicializador anterior'
     Stop-Process -Id $CurrentLauncherProcessId -Force -ErrorAction Stop
     $deadline = (Get-Date).AddSeconds(5)
     while ((Get-Date) -lt $deadline -and (Test-DssLauncherIdentity $CurrentLauncherProcessId)) {

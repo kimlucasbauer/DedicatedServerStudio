@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.5 — 2026-10-16
+
+### Added
+
+- Add a Minecraft card to the home screen with a clear coming-soon status.
+
+### Fixed
+
+- Show progress while the updater releases the previous PowerShell launcher, and load required Windows PowerShell modules explicitly.
+
 ## 0.4.4 — 2026-10-16
 
 ### Fixed

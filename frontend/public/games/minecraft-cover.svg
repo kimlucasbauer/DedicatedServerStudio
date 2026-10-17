@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 675" fill="none">
+  <defs>
+    <linearGradient id="sky" x1="600" y1="0" x2="600" y2="675" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6EC7EF"/>
+      <stop offset="1" stop-color="#C4F0D7"/>
+    </linearGradient>
+    <linearGradient id="shade" x1="600" y1="0" x2="600" y2="675" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#071B22" stop-opacity="0"/>
+      <stop offset="1" stop-color="#071B22" stop-opacity=".65"/>
+    </linearGradient>
+    <pattern id="pixels" width="96" height="96" patternUnits="userSpaceOnUse">
+      <path d="M0 0h48v48H0zM48 48h48v48H48z" fill="#fff" fill-opacity=".035"/>
+    </pattern>
+  </defs>
+  <path fill="url(#sky)" d="M0 0h1200v675H0z"/>
+  <path fill="#F9E89A" d="M918 85h94v94h-94zM871 132h47v47h-47zM1012 132h47v47h-47zM918 179h94v47h-94z"/>
+  <path fill="#EAF8F0" d="M139 99h96v24h48v48h-72v24h-96v-48h24zM350 62h120v24h48v48h-72v24H326v-48h24zM743 151h120v24h48v48h-72v24H719v-48h24z"/>
+  <path fill="#80BED0" d="M0 351 144 207l96 96 95-143 143 143 96-96 144 144 96-96 143 143 96-96 144 144v229H0z"/>
+  <path fill="#568B8F" d="m0 435 143-144 96 96 96-144 143 144 96-96 144 144 96-96 143 143 96-95 144 143v145H0z"/>
+  <path fill="#4C7649" d="M0 447h1200v228H0z"/>
+  <path fill="#6E9D4F" d="M0 423h1200v96H0z"/>
+  <path fill="#82B85A" d="M0 423h1200v32H0z"/>
+  <path fill="#49733F" d="M0 519h1200v156H0z"/>
+  <path fill="#6E9D4F" d="M0 519h1200v24H0z"/>
+  <path fill="#76523B" d="M0 543h1200v132H0z"/>
+  <path fill="#8B6244" d="M0 543h1200v25H0z"/>
+  <path fill="#5F452F" d="M0 568h1200v107H0z"/>
+  <path fill="#214B3D" d="M151 399h47v144h-47zM102 327h144v72H102zM126 279h96v48h-96zM914 383h48v160h-48zM865 311h144v72H865zM889 263h96v48h-96z"/>
+  <path fill="#3E7949" d="M127 327h95v48h-95zM151 279h48v48h-48zM890 311h95v48h-95zM914 263h48v48h-48z"/>
+  <path fill="#D6E6E0" fill-opacity=".82" d="M524 358h48v48h-48zM572 310h48v48h-48zM620 358h48v48h-48zM668 406h48v48h-48z"/>
+  <path fill="#32524A" d="M576 427h48v96h-48zM552 403h96v24h-96z"/>
+  <path fill="#4D7565" d="M576 427h48v24h-48z"/>
+  <path fill="#A8D474" d="M274 519h24v24h-24zM322 543h24v24h-24zM785 519h24v24h-24zM1050 519h24v24h-24z"/>
+  <path fill="#4B8146" d="M298 495h24v24h-24zM346 519h24v24h-24zM833 495h24v24h-24zM1098 495h24v24h-24z"/>
+  <path fill="url(#pixels)" d="M0 0h1200v675H0z"/>
+  <path fill="url(#shade)" d="M0 0h1200v675H0z"/>
+  <path fill="#10201D" fill-opacity=".75" d="M44 44h556v104H44z"/>
+  <text x="72" y="116" fill="#F4F1DE" font-family="Arial, sans-serif" font-size="54" font-weight="900" letter-spacing="3">MINECRAFT</text>
+</svg>
