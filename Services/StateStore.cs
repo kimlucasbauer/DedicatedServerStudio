@@ -226,19 +226,20 @@ public sealed class StateStore
         return path;
     }
 
-    public string GetPlayerHistoryPath(Guid id)
+    public string GetPlayerHistoryPath(Guid profileId, Guid serverId)
     {
-        // Keep recognized player history with DSS data rather than the install folder.
-        // This survives replacing or moving the application directory while leaving
-        // the user-requested application logs under the project root.
-        var directory = Path.Combine(DataDirectory, "servers", id.ToString("N"));
+        // Keep the roster in the persistent profile data tree, separate from the
+        // game installation and disposable console logs. Each server keeps its own
+        // roster because servers in a profile can represent different worlds.
+        var directory = Path.Combine(DataDirectory, "profiles", profileId.ToString("N"), "servers", serverId.ToString("N"));
         var path = Path.Combine(directory, "players.json");
         if (File.Exists(path)) return path;
 
         var legacyPaths = new[]
         {
-            Path.Combine(LogsDirectory, "servers", id.ToString("N"), "players.json"),
-            Path.Combine(DataDirectory, "instances", id.ToString("N"), "players.json")
+            Path.Combine(DataDirectory, "servers", serverId.ToString("N"), "players.json"),
+            Path.Combine(LogsDirectory, "servers", serverId.ToString("N"), "players.json"),
+            Path.Combine(DataDirectory, "instances", serverId.ToString("N"), "players.json")
         };
         foreach (var legacyPath in legacyPaths)
         {

@@ -961,19 +961,7 @@ app.MapGet("/api/network/local-addresses", (HttpContext context) =>
 app.MapGet("/api/network/public-address", async (HttpContext context, IHttpClientFactory clients, CancellationToken cancellationToken) =>
 {
     if (!RequireAuth(context, auth)) return Results.Unauthorized();
-    try
-    {
-        using var response = await clients.CreateClient("public-ip").GetAsync("https://api.ipify.org", cancellationToken);
-        if (!response.IsSuccessStatusCode) return Results.Ok(new { address = (string?)null });
-        var value = (await response.Content.ReadAsStringAsync(cancellationToken)).Trim();
-        return IPAddress.TryParse(value, out var address)
-            ? Results.Ok(new { address = address.ToString() })
-            : Results.Ok(new { address = (string?)null });
-    }
-    catch (Exception error) when (error is HttpRequestException or OperationCanceledException)
-    {
-        return Results.Ok(new { address = (string?)null });
-    }
+    return Results.Ok(new { address = await GetPublicIpv4Async(clients, cancellationToken) });
 });
 
 app.MapGet("/api/processes/metrics", async (HttpContext context) =>
@@ -1027,18 +1015,7 @@ app.MapGet("/api/instances/{id:guid}/network/connectivity", async (Guid id, Guid
     if (root is null || endpoint is null) return Results.NotFound();
     var profile = root.WithServer(endpoint);
     var localAddresses = GetLocalIpv4Addresses();
-    string? publicAddress = null;
-    try
-    {
-        using var response = await clients.CreateClient("public-ip").GetAsync("https://api.ipify.org", cancellationToken);
-        if (response.IsSuccessStatusCode)
-        {
-            var value = (await response.Content.ReadAsStringAsync(cancellationToken)).Trim();
-            if (IPAddress.TryParse(value, out var parsed) && parsed.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork)
-                publicAddress = parsed.ToString();
-        }
-    }
-    catch (Exception error) when (error is HttpRequestException or OperationCanceledException) { }
+    var publicAddress = await GetPublicIpv4Async(clients, cancellationToken);
 
     var running = supervisor.GetStatus(endpoint.Id) == "running";
     var queryPort = profile.Port + 1;
@@ -1058,38 +1035,59 @@ app.MapGet("/api/instances/{id:guid}/network/connectivity", async (Guid id, Guid
     if (profile.Crossplay || !profile.GameId.Equals("valheim", StringComparison.OrdinalIgnoreCase) || queryPort is < 1 or > 65535)
     {
         var message = profile.Crossplay
-            ? "Crossplay usa relay; a conexão não pode ser confirmada por IP direto."
+            ? "Crossplay usa um relay; conexões não são verificadas por consulta UDP direta."
             : "O servidor está ativo, mas o teste UDP de consulta não está disponível para este jogo.";
+        var status = profile.Crossplay ? "relay" : "unsupported";
         return Results.Ok(new
         {
             running,
             crossplay = profile.Crossplay,
             port = profile.Port,
             queryPort,
-            localAddresses = localAddresses.Select(address => new { address, status = "restricted", message }).ToArray(),
-            publicAddress = publicAddress is null ? null : new { address = publicAddress, status = "restricted", message }
+            localAddresses = localAddresses.Select(address => new { address, status, message }).ToArray(),
+            publicAddress = publicAddress is null ? null : new { address = publicAddress, status, message }
         });
     }
 
-    var loopbackTask = playerManagement.CanQueryServerAsync(IPAddress.Loopback, queryPort, cancellationToken);
-    var localChecksTask = Task.WhenAll(localAddresses.Select(address => playerManagement.CanQueryServerAsync(IPAddress.Parse(address), queryPort, cancellationToken)));
+    async Task<(bool QueryPort, bool GamePort)> ProbeAddressAsync(IPAddress address)
+    {
+        var queryTask = playerManagement.CanQueryServerAsync(address, queryPort, cancellationToken);
+        var gameTask = playerManagement.CanQueryServerAsync(address, profile.Port, cancellationToken);
+        await Task.WhenAll(queryTask, gameTask);
+        return (await queryTask, await gameTask);
+    }
+
+    var loopbackTask = ProbeAddressAsync(IPAddress.Loopback);
+    var localChecksTask = Task.WhenAll(localAddresses.Select(address => ProbeAddressAsync(IPAddress.Parse(address))));
     var publicCheckTask = publicAddress is null
-        ? Task.FromResult(false)
-        : playerManagement.CanQueryServerAsync(IPAddress.Parse(publicAddress), queryPort, cancellationToken);
-    await Task.WhenAll(loopbackTask, localChecksTask, publicCheckTask);
+        ? Task.FromResult((QueryPort: false, GamePort: false))
+        : ProbeAddressAsync(IPAddress.Parse(publicAddress));
+    var logPath = supervisor.GetConsoleLogPath(endpoint.Id) ?? state.GetServerLogPath(endpoint.Id);
+    var observationTask = playerManagement.GetConnectionObservationAsync(logPath, cancellationToken);
+    await Task.WhenAll(loopbackTask, localChecksTask, publicCheckTask, observationTask);
     var loopbackResponded = await loopbackTask;
     var localChecks = await localChecksTask;
     var publicResponded = await publicCheckTask;
+    var observation = await observationTask;
+    var hasRecentPlayerConnection = observation.ActiveConnections > 0 || observation.LastSeenAt is { } lastSeen &&
+        DateTimeOffset.UtcNow - lastSeen <= TimeSpan.FromMinutes(5);
 
-    object BuildStatus(string address, bool responded, bool isPublic)
+    object BuildStatus(string address, (bool QueryPort, bool GamePort) probe, bool isPublic)
     {
-        if (responded)
-            return new { address, status = "online", message = "O servidor respondeu à consulta UDP neste endereço." };
-        if (loopbackResponded)
-            return new { address, status = "restricted", message = isPublic
-                ? "O servidor responde localmente; o acesso público e o encaminhamento do roteador não foram confirmados."
-                : "O servidor responde localmente, mas não por este IP; confira o Firewall e as portas UDP." };
-        return new { address, status = "restricted", message = "O processo está ativo, mas a porta de consulta UDP não respondeu ao teste." };
+        if (probe.QueryPort)
+            return new { address, status = "online", message = "A consulta Steam respondeu neste endereço pela porta UDP de consulta." };
+        if (probe.GamePort)
+            return new { address, status = "online", message = "O servidor respondeu à consulta UDP na porta principal do jogo." };
+        if (hasRecentPlayerConnection)
+            return new { address, status = "observed", message = "Os logs confirmam que jogadores se conectaram recentemente; a consulta Steam não confirmou este endereço diretamente." };
+        var message = !profile.IsPublic
+            ? "A visibilidade pública está desativada; a consulta Steam pode não responder mesmo que conexões diretas estejam funcionando."
+            : isPublic
+                ? "A consulta UDP não respondeu deste computador. NAT loopback pode impedir este teste; isso não confirma que conexões externas estejam bloqueadas."
+                : loopbackResponded.QueryPort || loopbackResponded.GamePort
+                    ? "A consulta respondeu no próprio DSS, mas não por este endereço. Isso não prova que a porta de jogo esteja bloqueada; confirme por um cliente nessa rede."
+                    : "A consulta Steam UDP não respondeu. Isso não prova que a porta de jogo esteja bloqueada; confirme usando um cliente Valheim nessa rede.";
+        return new { address, status = "unverified", message };
     }
 
     return Results.Ok(new
@@ -1098,7 +1096,7 @@ app.MapGet("/api/instances/{id:guid}/network/connectivity", async (Guid id, Guid
         crossplay = false,
         port = profile.Port,
         queryPort,
-        localAddresses = localAddresses.Select((address, index) => BuildStatus(address.ToString(), localChecks[index], false)).ToArray(),
+        localAddresses = localAddresses.Select((address, index) => BuildStatus(address, localChecks[index], false)).ToArray(),
         publicAddress = publicAddress is null ? null : BuildStatus(publicAddress, publicResponded, true)
     });
 });
@@ -1688,7 +1686,7 @@ app.MapGet("/api/instances/{id:guid}/players", async (Guid id, Guid? serverId, H
     {
         var saveDirectory = SavePathResolver.Resolve(profile, state.DataDirectory);
         var logPath = supervisor.GetConsoleLogPath(endpoint.Id) ?? state.GetServerLogPath(endpoint.Id);
-        var historyPath = state.GetPlayerHistoryPath(endpoint.Id);
+        var historyPath = state.GetPlayerHistoryPath(root.Id, endpoint.Id);
         var snapshot = await playerManagement.GetAsync(profile, saveDirectory, logPath, historyPath,
             supervisor.GetStatus(endpoint.Id) == "running", cancellationToken);
         return Results.Ok(snapshot);
@@ -1710,11 +1708,12 @@ app.MapPost("/api/instances/{id:guid}/players/{action}", async (Guid id, string 
     try
     {
         var playerId = input.UserId?.Trim() ?? "";
+        var playerName = input.PlayerName?.Trim() ?? "";
         var saveDirectory = SavePathResolver.Resolve(profile, state.DataDirectory);
         var isRunning = supervisor.GetStatus(endpoint.Id) == "running";
         if (action == "kick" && !isRunning)
             return Results.Conflict(new { error = "Inicie o servidor para kickar um jogador conectado." });
-        if ((action is "kick" or "ban" or "unban") && isRunning)
+        if (action == "kick")
         {
             if (playerId.Length is 0 or > 160 || playerId.Any(character =>
                     !(character is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9' or '_' or ':' or '-')))
@@ -1725,58 +1724,94 @@ app.MapPost("/api/instances/{id:guid}/players/{action}", async (Guid id, string 
                 return Results.Conflict(new { error = "Para aplicar esta ação durante a execução, instale e ative DreamWraith-ConsoleStdinHeeler e reinicie o servidor." });
 
             var logPath = supervisor.GetConsoleLogPath(endpoint.Id) ?? state.GetServerLogPath(endpoint.Id);
-            var historyPath = state.GetPlayerHistoryPath(endpoint.Id);
+            var historyPath = state.GetPlayerHistoryPath(root.Id, endpoint.Id);
             var snapshot = await playerManagement.GetAsync(profile, saveDirectory, logPath, historyPath, true, cancellationToken);
-            var target = snapshot.Players.FirstOrDefault(player =>
-                string.Equals(player.UserId, playerId, StringComparison.Ordinal));
+            var matchingPlayers = snapshot.Players.Where(player =>
+                string.Equals(player.UserId, playerId, StringComparison.Ordinal)).ToArray();
+            var target = playerName.Length > 0
+                ? matchingPlayers.FirstOrDefault(player => string.Equals(player.Name, playerName, StringComparison.OrdinalIgnoreCase))
+                : matchingPlayers.OrderByDescending(player => player.IsActive).FirstOrDefault();
             if (action == "kick" && (target is null || !target.IsActive))
                 return Results.Conflict(new { error = "O jogador não está mais conectado; atualize a lista antes de tentar kická-lo." });
 
-            var commandTarget = action == "kick" && !string.IsNullOrWhiteSpace(target?.UserId)
-                ? target.UserId
-                : target?.Name ?? playerId;
-            var command = action == "kick" && !string.IsNullOrWhiteSpace(target?.UserId)
-                ? $"{action} {commandTarget}"
-                : $"{action} {QuoteConsoleArgument(commandTarget)}";
+            // Kicks are session actions, so address the exact live character by name.
+            var command = $"kick {QuoteConsoleArgument(target!.Name)}";
             var sent = await supervisor.SendCommandAsync(endpoint.Id, command);
             if (!sent.Success) return Results.Conflict(new { error = sent.Message });
 
-            if (action == "kick")
+            var disconnected = false;
+            for (var attempt = 0; attempt < 10; attempt++)
             {
-                var disconnected = false;
-                for (var attempt = 0; attempt < 10; attempt++)
+                await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
+                var afterKick = await playerManagement.GetAsync(profile, saveDirectory, logPath, historyPath, true, cancellationToken);
+                if (afterKick.LivePlayerNames is { } liveNames)
                 {
-                    await Task.Delay(TimeSpan.FromMilliseconds(500), cancellationToken);
-                    var afterKick = await playerManagement.GetAsync(profile, saveDirectory, logPath, historyPath, true, cancellationToken);
-                    if (afterKick.LivePlayerNames is { } liveNames)
-                    {
-                        if (!liveNames.Contains(target!.Name.Trim(), StringComparer.OrdinalIgnoreCase))
-                        {
-                            disconnected = true;
-                            break;
-                        }
-                    }
-                    else if (!afterKick.Players.Any(player => player.IsActive &&
-                                 (string.Equals(player.UserId, target!.UserId, StringComparison.Ordinal) ||
-                                  string.Equals(player.Name.Trim(), target.Name.Trim(), StringComparison.OrdinalIgnoreCase))))
+                    if (!liveNames.Contains(target!.Name.Trim(), StringComparer.OrdinalIgnoreCase))
                     {
                         disconnected = true;
                         break;
                     }
                 }
-                if (!disconnected)
-                    return Results.Conflict(new { error = $"O comando de kick foi enviado, mas o DSS não confirmou a saída de {target!.Name}. Verifique a saída do ConsoleStdinHeeler e tente novamente." });
-
-                await state.UpdateAsync(data =>
+                else if (!afterKick.Players.Any(player => player.IsActive &&
+                             string.Equals(player.Name.Trim(), target!.Name.Trim(), StringComparison.OrdinalIgnoreCase)))
                 {
-                    data.Revisions.Add(new ConfigRevision { InstanceId = id, Kind = "profile-action", Target = "jogadores", Summary = "Jogador removido do servidor", CanRollback = false });
-                    return true;
-                });
-                return Results.Ok(new PlayerListMutation(true, $"{target!.Name} foi desconectado do servidor.", false));
+                    disconnected = true;
+                    break;
+                }
+            }
+            if (!disconnected)
+                return Results.Conflict(new { error = $"O comando de kick foi enviado, mas o DSS não confirmou a saída de {target!.Name}. Verifique a saída do ConsoleStdinHeeler e tente novamente." });
+
+            await state.UpdateAsync(data =>
+            {
+                data.Revisions.Add(new ConfigRevision { InstanceId = id, Kind = "profile-action", Target = "jogadores", Summary = "Jogador removido do servidor", CanRollback = false });
+                return true;
+            });
+            return Results.Ok(new PlayerListMutation(true, $"{target!.Name} foi desconectado do servidor.", false));
+        }
+
+        string? banCommandNotice = null;
+        var banCommandSent = false;
+        if (action == "ban" && isRunning)
+        {
+            if (playerId.Length is 0 or > 160 || playerId.Any(character =>
+                    !(character is >= 'A' and <= 'Z' or >= 'a' and <= 'z' or >= '0' and <= '9' or '_' or ':' or '-')))
+                return Results.BadRequest(new { error = "Informe um ID de plataforma válido." });
+
+            var logPath = supervisor.GetConsoleLogPath(endpoint.Id) ?? state.GetServerLogPath(endpoint.Id);
+            var historyPath = state.GetPlayerHistoryPath(root.Id, endpoint.Id);
+            var snapshot = await playerManagement.GetAsync(profile, saveDirectory, logPath, historyPath, true, cancellationToken);
+            var matchingPlayers = snapshot.Players.Where(player =>
+                string.Equals(player.UserId, playerId, StringComparison.Ordinal)).ToArray();
+            var target = playerName.Length > 0
+                ? matchingPlayers.FirstOrDefault(player => string.Equals(player.Name, playerName, StringComparison.OrdinalIgnoreCase))
+                : matchingPlayers.OrderByDescending(player => player.IsActive).FirstOrDefault();
+
+            // A persistent Valheim ban is stored by platform ID. If that character
+            // is online, also send the game's name-based command when available;
+            // the saved ban still works when the player is offline or the console mod
+            // is not installed.
+            if (target?.IsActive == true)
+            {
+                var consoleModReady = await state.ReadAsync(data => data.InstalledMods.Any(mod => mod.InstanceId == id &&
+                    mod.PackageId.Equals("DreamWraith-ConsoleStdinHeeler", StringComparison.OrdinalIgnoreCase) && mod.Enabled));
+                if (!consoleModReady)
+                    banCommandNotice = "O ID ficará banido nos próximos acessos; instale o ConsoleStdinHeeler para aplicar o banimento imediatamente ao jogador conectado.";
+                else
+                {
+                    var sent = await supervisor.SendCommandAsync(endpoint.Id, $"ban {QuoteConsoleArgument(target.Name)}");
+                    if (sent.Success) banCommandSent = true;
+                    else banCommandNotice = "O ID ficará banido nos próximos acessos, mas o DSS não conseguiu enviar o banimento imediato.";
+                }
             }
         }
+
         var mutation = await playerManagement.UpdateAccessAsync(saveDirectory, action, playerId,
             isRunning, cancellationToken);
+        if (action == "ban" && banCommandNotice is not null)
+            mutation = mutation with { Message = banCommandNotice };
+        else if (action == "ban" && banCommandSent)
+            mutation = mutation with { Changed = true, Message = "O comando de banimento imediato também foi enviado ao servidor." };
         if (mutation.Changed)
             await state.UpdateAsync(data =>
             {
@@ -2271,6 +2306,69 @@ app.MapPost("/api/instances/{id:guid}/mods/{modId:guid}/enabled", async (Guid id
     catch (ModInstallException ex) { return Results.Json(new { error = ex.Message }, statusCode: (int)ex.StatusCode); }
     catch (IOException) { return Results.Problem("Não foi possível alterar os arquivos do mod.", statusCode: StatusCodes.Status500InternalServerError); }
     catch (UnauthorizedAccessException) { return Results.Problem("O Windows negou acesso aos arquivos do mod.", statusCode: StatusCodes.Status403Forbidden); }
+});
+
+app.MapPost("/api/instances/{id:guid}/mods/enabled-batch", async (Guid id, ModEnabledBatchInput input, HttpContext context, CancellationToken cancellationToken) =>
+{
+    if (!RequireAuth(context, auth)) return Results.Unauthorized();
+    if (await IsGroupRunningAsync(id, state, supervisor)) return Results.Conflict(new { error = "Pare todos os servidores deste perfil antes de ativar ou desativar mods." });
+    if (input.ModIds is null || input.ModIds.Count is 0 or > 200 || input.ModIds.Any(modId => modId == Guid.Empty) || input.Enabled is null)
+        return Results.BadRequest(new { error = "Selecione entre 1 e 200 mods válidos e informe o estado desejado." });
+    var modOwnerId = await ResolveModOwnerIdAsync(id, state);
+    if (modOwnerId is null) return Results.NotFound();
+    var ids = input.ModIds.Distinct().ToArray();
+    var before = await state.ReadAsync(data => data.InstalledMods.Where(item => item.InstanceId == modOwnerId).ToDictionary(item => item.Id));
+    var selected = ids.Where(before.ContainsKey).Select(modId => before[modId]).ToArray();
+    if (selected.Length != ids.Length) return Results.NotFound(new { error = "Um ou mais mods selecionados não estão neste perfil." });
+    var changedLocked = selected.Where(item => item.Locked && item.Enabled != input.Enabled.Value).Select(item => item.Name).ToArray();
+    if (changedLocked.Length > 0)
+        return Results.Conflict(new { error = $"Desbloqueie estes mods antes de alterar o estado: {string.Join(", ", changedLocked)}." });
+
+    var failures = new List<object>();
+    var affectedIds = ids.ToHashSet();
+    foreach (var mod in selected.Where(item => item.Enabled != input.Enabled.Value))
+    {
+        try
+        {
+            // A cascata é confirmada uma única vez pela interface antes de chamar este endpoint.
+            var related = await modPackages.SetEnabledWithDependentsAsync(modOwnerId.Value, mod.Id, input.Enabled.Value,
+                cascadeDependents: true, cancellationToken);
+            foreach (var item in related) affectedIds.Add(item.Id);
+        }
+        catch (ModInstallException ex) { failures.Add(new { modId = mod.Id, name = mod.Name, error = ex.Message }); }
+        catch (IOException) { failures.Add(new { modId = mod.Id, name = mod.Name, error = "Não foi possível alterar os arquivos deste mod." }); }
+        catch (UnauthorizedAccessException) { failures.Add(new { modId = mod.Id, name = mod.Name, error = "O Windows negou acesso aos arquivos deste mod." }); }
+    }
+
+    var after = await state.ReadAsync(data => data.InstalledMods.Where(item => item.InstanceId == modOwnerId).ToDictionary(item => item.Id));
+    var changedMods = before.Values.Where(item => affectedIds.Contains(item.Id) && after.TryGetValue(item.Id, out var current) && current.Enabled != item.Enabled)
+        .Select(item => new { item.Id, item.Name, Enabled = after[item.Id].Enabled }).OrderBy(item => item.Name, StringComparer.OrdinalIgnoreCase).ToArray();
+    var logToggleActions = await state.ReadAsync(data => data.Instances.FirstOrDefault(item => item.Id == id)?.LogModToggleActions == true);
+    if (logToggleActions && changedMods.Length > 0)
+    {
+        var enabled = input.Enabled.Value;
+        await state.UpdateAsync(data =>
+        {
+            data.Revisions.Add(new ConfigRevision
+            {
+                InstanceId = id,
+                Kind = "mod-package",
+                Target = "Mods do perfil",
+                Summary = $"{changedMods.Length} {(changedMods.Length == 1 ? "mod" : "mods")} {(enabled ? "ativado" : "desativado")} em lote",
+                CanRollback = false,
+                ModToggleNames = changedMods.Select(item => item.Name).ToList(),
+                ModToggleEnabled = enabled
+            });
+            return true;
+        });
+    }
+
+    var changedCount = changedMods.Length;
+    var action = input.Enabled.Value ? "ativado" : "desativado";
+    var message = $"{changedCount} {(changedCount == 1 ? "mod" : "mods")} {action}{(changedCount == 1 ? "" : "s")} em lote.";
+    if (failures.Count == 1) message += " 1 mod não pôde ser alterado.";
+    else if (failures.Count > 1) message += $" {failures.Count} mods não puderam ser alterados.";
+    return Results.Ok(new { changed = changedMods, failed = failures, message });
 });
 
 app.MapPost("/api/instances/{id:guid}/mods/{modId:guid}/locked", async (Guid id, Guid modId, JsonElement input, HttpContext context) =>
@@ -3629,6 +3727,8 @@ static RevisionDetailView ToRevisionDetail(ConfigRevision revision)
         ModVersion = revision.ModVersion,
         ModIconUrl = revision.ModIconUrl,
         ModProjectUrl = revision.ModProjectUrl,
+        ModToggleNames = revision.ModToggleNames ?? [],
+        ModToggleEnabled = revision.ModToggleEnabled,
         FilesInstalled = revision.FilesInstalled ?? [],
         FilesRemoved = revision.FilesRemoved ?? [],
         FilesPreserved = revision.FilesPreserved ?? []
@@ -3762,6 +3862,8 @@ static RevisionView ToRevisionView(ConfigRevision revision) => new(
     ModVersion = revision.ModVersion,
     ModIconUrl = revision.ModIconUrl,
     ModProjectUrl = revision.ModProjectUrl,
+    ModToggleNames = revision.ModToggleNames ?? [],
+    ModToggleEnabled = revision.ModToggleEnabled,
     FilesInstalled = revision.FilesInstalled ?? [],
     FilesRemoved = revision.FilesRemoved ?? [],
     FilesPreserved = revision.FilesPreserved ?? []
@@ -3930,6 +4032,49 @@ static string[] GetLocalIpv4Addresses()
             .ToArray();
     }
     catch (NetworkInformationException) { return []; }
+}
+
+static async Task<string?> GetPublicIpv4Async(IHttpClientFactory clients, CancellationToken cancellationToken)
+{
+    using var attempts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+    var client = clients.CreateClient("public-ip");
+    async Task<string?> FetchAsync(string endpoint)
+    {
+        try
+        {
+            using var response = await client.GetAsync(endpoint, HttpCompletionOption.ResponseHeadersRead, attempts.Token);
+            if (!response.IsSuccessStatusCode) return null;
+            var value = (await response.Content.ReadAsStringAsync(attempts.Token)).Trim();
+            return IPAddress.TryParse(value, out var address) && address.AddressFamily == System.Net.Sockets.AddressFamily.InterNetwork
+                ? address.ToString()
+                : null;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { return null; }
+        catch (HttpRequestException) { return null; }
+    }
+
+    var requests = new[]
+    {
+        FetchAsync("https://api.ipify.org"),
+        FetchAsync("https://checkip.amazonaws.com")
+    };
+    try
+    {
+        var pending = requests.ToList();
+        while (pending.Count > 0)
+        {
+            var completed = await Task.WhenAny(pending);
+            pending.Remove(completed);
+            if (await completed is { } address) return address;
+        }
+        return null;
+    }
+    finally
+    {
+        attempts.Cancel();
+        try { await Task.WhenAll(requests); }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { }
+    }
 }
 
 static bool IsPrivateIpv4(IPAddress address)

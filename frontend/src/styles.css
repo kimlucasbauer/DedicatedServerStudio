@@ -682,9 +682,12 @@ mark.diff-removed span,mark.diff-added span {color:inherit!important}
 .address-choice-meta {display:flex;align-items:center;flex-wrap:wrap;gap:5px 9px;min-width:0}
 .address-health {display:inline-flex;align-items:center;gap:4px;white-space:nowrap;font-weight:700}
 .address-health.online {color:#b8e98e}
+.address-health.observed {color:#b8e98e}
 .address-health.offline {color:#f09383}
 .address-health.restricted {color:#e6c778}
 .address-health.checking {color:#83c9e5}
+.address-health.unverified,.address-health.unsupported {color:#8fa5b1}
+.address-health.relay {color:#83c9e5}
 .address-state {display:flex;align-items:center;gap:7px;margin:1px 2px;color:#91a6b2;font-size:.72rem;line-height:1.4;overflow-wrap:anywhere}
 .address-popover-hint {margin:0;padding-top:9px;border-top:1px solid #2a3942;color:#8298a4;font-size:.67rem;line-height:1.45}
 @keyframes address-pop-in {from {opacity:0;transform:translate(-50%,5px) scale(.985)}to {opacity:1;transform:translate(-50%,0) scale(1)}}
@@ -1934,6 +1937,23 @@ select.field:focus-visible{border-color:#83ad60;box-shadow:0 0 0 3px #a8dd7520}
 .mod-history-files>small {color:#8fa4af;font-size:.75rem}
 .mod-history-date {line-height:1.45}
 @media(max-width:560px){.mod-history-item{padding:10px;gap:9px}.mod-history-heading .button{width:100%}.mod-history-files{grid-template-columns:minmax(0,1fr)}}
+.mod-toggle-batch-entry {cursor:pointer;transition:border-color .16s ease,background .16s ease,transform .16s ease}
+.mod-toggle-batch-entry:hover {border-color:#6a8755;background:#1b2a2d;transform:translateY(-1px)}
+.mod-toggle-batch-entry:focus-visible {outline:2px solid #b9e98e;outline-offset:2px}
+.mod-toggle-batch-detail {display:flex;flex:1;flex-direction:column;min-height:0;gap:14px;padding:15px;border:1px solid #34464e;border-radius:13px;background:linear-gradient(145deg,#192831,#152129)}
+.mod-toggle-batch-detail>header {display:flex;align-items:center;gap:12px;padding:2px 2px 14px;border-bottom:1px solid #2e4149}
+.mod-toggle-batch-detail>header>span:nth-child(2) {display:grid;gap:4px;flex:1;min-width:0}
+.mod-toggle-batch-detail>header>span:nth-child(2)>b {color:#e1ebee;font-size:.95rem}
+.mod-toggle-batch-detail>header>span:nth-child(2)>small {color:#8fa7b2;font-size:.78rem}
+.mod-toggle-batch-mark {width:42px;height:42px;display:grid;place-items:center;flex:0 0 42px;border:1px solid #49663c;border-radius:12px;background:#26382c;color:#b9e78a}
+.mod-toggle-batch-mark.disabled {border-color:#694a48;background:#352829;color:#e28e7e}
+.mod-toggle-batch-list {display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,280px),1fr));align-content:start;gap:8px;overflow:auto;padding:1px 3px 2px 1px}
+.mod-toggle-batch-mod {display:flex;align-items:center;gap:10px;min-width:0;padding:10px 11px;border:1px solid #30414a;border-radius:10px;background:#121d24;color:#b9cbd1}
+.mod-toggle-batch-mod>span {width:25px;flex:0 0 25px;color:#77909a;font:700 .68rem ui-monospace,Consolas,monospace}
+.mod-toggle-batch-mod>svg {flex:0 0 auto;color:#a9d978}
+.mod-toggle-batch-mod>b {overflow-wrap:anywhere;font-size:.82rem;font-weight:700}
+.mod-toggle-batch-modal .modal-content>.revision-actor {flex:0 0 auto;margin-bottom:12px}
+@media(max-width:560px){.mod-toggle-batch-entry{padding:10px;gap:9px}.mod-toggle-batch-detail{padding:11px}.mod-toggle-batch-detail>header{align-items:flex-start;flex-wrap:wrap}.mod-toggle-batch-detail>header>.state-badge{margin-left:54px}}
 .language-save-status {display:flex;align-items:center;gap:6px;color:#9fcf78;font-size:.75rem;font-weight:600}
 .profile-read-only-settings {display:grid;gap:13px}
 .profile-read-only-grid {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin:0}

@@ -137,6 +137,8 @@ public sealed class ConfigRevision
     public string ModVersion { get; set; } = "";
     public string? ModIconUrl { get; set; }
     public string? ModProjectUrl { get; set; }
+    public List<string> ModToggleNames { get; set; } = [];
+    public bool? ModToggleEnabled { get; set; }
     public List<string> FilesInstalled { get; set; } = [];
     public List<string> FilesRemoved { get; set; } = [];
     public List<string> FilesPreserved { get; set; } = [];
@@ -263,7 +265,7 @@ public sealed record UiLanguageInput(string? Language);
 public sealed record ProfileHistorySettingsInput(bool LogModToggleActions);
 
 public sealed record ConsoleCommandInput(string Command);
-public sealed record PlayerAccessInput(string UserId);
+public sealed record PlayerAccessInput(string UserId, string? PlayerName = null);
 
 public sealed record ProfileImageInput(string ImageData);
 public sealed record ManagedProcessMetrics(int ProcessId, long WorkingSetBytes, double CpuPercent, double UptimeSeconds,
@@ -288,6 +290,8 @@ public sealed record RevisionView(
     public string? ModVersion { get; init; }
     public string? ModIconUrl { get; init; }
     public string? ModProjectUrl { get; init; }
+    public IReadOnlyList<string> ModToggleNames { get; init; } = [];
+    public bool? ModToggleEnabled { get; init; }
     public IReadOnlyList<string> FilesInstalled { get; init; } = [];
     public IReadOnlyList<string> FilesRemoved { get; init; } = [];
     public IReadOnlyList<string> FilesPreserved { get; init; } = [];
@@ -313,6 +317,8 @@ public sealed record RevisionDetailView(
     public string? ModVersion { get; init; }
     public string? ModIconUrl { get; init; }
     public string? ModProjectUrl { get; init; }
+    public IReadOnlyList<string> ModToggleNames { get; init; } = [];
+    public bool? ModToggleEnabled { get; init; }
     public IReadOnlyList<string> FilesInstalled { get; init; } = [];
     public IReadOnlyList<string> FilesRemoved { get; init; } = [];
     public IReadOnlyList<string> FilesPreserved { get; init; } = [];
@@ -357,3 +363,4 @@ public sealed record ModInstallInput(string Provider, string PackageId, IReadOnl
 public sealed record ModInstallBatchInput(string Provider, IReadOnlyList<string> PackageIds, IReadOnlyDictionary<string, string>? DependencyVersions = null);
 public sealed record ModUninstallBatchInput(IReadOnlyList<Guid> ModIds);
 public sealed record ModLockBatchInput(IReadOnlyList<Guid> ModIds, bool Locked);
+public sealed record ModEnabledBatchInput(IReadOnlyList<Guid> ModIds, bool? Enabled);

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.6 — 2026-10-17
+
+### Added
+
+- Save recognized player history in persistent profile data, with playtime tracked separately for each character.
+- Group bulk mod activation and deactivation into one profile-history entry with a detail view listing the affected mods.
+
+### Fixed
+
+- Improve the Valheim connectivity check by retrying Steam UDP queries on the game and query ports, and show recent player connections as evidence when a direct query cannot confirm access.
+- Match live character sessions more accurately when one platform ID is associated with multiple characters; clarify that Valheim's persistent ban list applies to the platform ID and all associated characters.
+
 ## 0.4.5 — 2026-10-16
 
 ### Added
