@@ -7,7 +7,7 @@
     <AssemblyName>DedicatedServerStudio</AssemblyName>
     <RootNamespace>DedicatedServerStudio</RootNamespace>
     <Product>Dedicated Server Studio</Product>
-    <Version>0.4.7</Version>
+    <Version>0.4.8</Version>
     <DssUpdaterEnabled Condition="'$(DssUpdaterEnabled)' == ''">true</DssUpdaterEnabled>
     <DefineConstants Condition="'$(DssUpdaterEnabled)' != 'false'">$(DefineConstants);DSS_UPDATER_ENABLED</DefineConstants>
   </PropertyGroup>

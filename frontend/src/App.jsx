@@ -1454,8 +1454,10 @@ function PlayerManagementModal({ profile, close }) {
     const normalize=value=>value.toLocaleLowerCase().replace(/^steam[_:]/,'').replace(/[^a-z0-9]/g,'');
     const nameLooksLikeId=!name||name.toLocaleLowerCase()===id.toLocaleLowerCase()||
       normalize(name)===normalize(id)||/^\d{15,20}$/.test(name);
-    const hasPlaytime=(Number(player.sessionSeconds)||0)>0||(Number(player.totalSeconds)||0)>0;
-    return !(!player.isActive&&nameLooksLikeId&&!hasPlaytime);
+    const totalSeconds=Math.max(0,Number(player.totalSeconds)||0);
+    // The roster displays whole minutes; sub-minute totals still appear as 0min.
+    const hasDisplayedPlaytime=Math.floor(totalSeconds/60)>0;
+    return !(!player.isActive&&nameLooksLikeId&&!hasDisplayedPlaytime);
   });
   const activeCount=snapshot?.activeCount;
   return <Modal className="player-management-modal profile-operate-controls" title={`Gestão de jogadores · ${profile.name}`} description="Acompanhe a sessão, consulte o tempo registrado e edite os acessos do servidor." close={close}>
@@ -2320,7 +2322,41 @@ function BepInExEditor({ profile, groupRunning = false, accessReadOnly = false }
   async function deleteConfig(name){if(readOnly)return;if(groupRunning||profile.runtimeStatus==='running')return toast('Pare todos os servidores do perfil antes de excluir um arquivo BepInEx.','error');const hasDraft=isDraftDirty(name);if(!await confirm({title:'Excluir arquivo de configuração',description:`Excluir ${name}? O arquivo poderá ser gerado novamente na próxima inicialização do servidor.${hasDraft?' As alterações locais não salvas também serão descartadas.':''}`,confirmLabel:'Segure 5 s para excluir',confirmHoldMs:5000,danger:true}))return;try{const r=await api(`/api/instances/${profile.id}/configs/${name.split('/').map(encodeURIComponent).join('/')}`,{method:'DELETE'});configDraftCache.delete(configDraftKey(profile.id,name));if(activeConfigFiles.get(profile.id)===name)activeConfigFiles.delete(profile.id);notifyConfigDrafts();if(file===name){setFile('');setContent('');setSaved('');closeDiff();}toast(r.message||'Arquivo excluído.');await loadFiles();}catch(e){toast(e.message,'error');}}
   function toggleBulkConfig(name,checked){if(readOnly)return;setBulkSelected(current=>{const next=new Set(current);if(checked)next.add(name);else next.delete(name);return next;});}
   async function deleteSelectedConfigs(){if(readOnly||deletingBulk)return;const selected=bulkConfigFiles.filter(name=>bulkSelected.has(name));if(!selected.length)return;setDeletingBulk(true);try{const result=await api(`/api/instances/${profile.id}/configs/delete-batch`,{method:'POST',body:json({paths:selected})});const deleted=new Set(result.deleted||[]);for(const name of deleted){configDraftCache.delete(configDraftKey(profile.id,name));if(activeConfigFiles.get(profile.id)===name)activeConfigFiles.delete(profile.id);}notifyConfigDrafts();if(deleted.has(file)){setFile('');setContent('');setSaved('');closeDiff();}setBulkSelected(new Set());setBulkDeleteOpen(false);toast(result.message||`${deleted.size} configuração(ões) excluída(s).`,result.failed?.length?'error':'success');await loadFiles();}catch(error){toast(error.message,'error');}finally{setDeletingBulk(false);}}
-  function findNext(){if(!find)return;const el=textarea.current;if(!el)return;const escaped=find.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),findFrom=start=>{const matcher=new RegExp(escaped,'ig');matcher.lastIndex=Math.max(0,start);return matcher.exec(content)?.index??-1;};let at=findFrom(el.selectionEnd);if(at<0)at=findFrom(0);if(at<0){setHint('Texto não encontrado.');return;}el.focus({preventScroll:true});el.setSelectionRange(at,at+find.length);syncScroll(el);requestAnimationFrame(()=>syncScroll(el));setHint('Correspondência destacada. A seleção será mantida até você editar o arquivo.');}
+  function findNext(){
+    if(!find)return;
+    const el=textarea.current;
+    if(!el)return;
+    const escaped=find.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),findFrom=start=>{
+      const matcher=new RegExp(escaped,'ig');
+      matcher.lastIndex=Math.max(0,start);
+      return matcher.exec(content)?.index??-1;
+    };
+    let at=findFrom(el.selectionEnd);
+    if(at<0)at=findFrom(0);
+    if(at<0){setHint('Texto não encontrado.');return;}
+
+    let line=0;
+    for(let index=0;index<at;index++)if(content.charCodeAt(index)===10)line++;
+    const lineStart=content.lastIndexOf('\n',at-1)+1;
+    const column=at-lineStart;
+    const style=window.getComputedStyle(el);
+    const lineHeight=parseFloat(style.lineHeight)||21;
+    const paddingTop=parseFloat(style.paddingTop)||12;
+    const charWidth=(parseFloat(style.fontSize)||13)*0.602;
+    const targetTop=Math.max(0,paddingTop+line*lineHeight-(el.clientHeight-lineHeight)/2);
+    const targetLeft=Math.max(0,column*charWidth-(el.clientWidth-charWidth*find.length)/2);
+    const scrollToMatch=()=>{
+      el.scrollTop=targetTop;
+      el.scrollLeft=targetLeft;
+      syncScroll(el);
+    };
+
+    el.focus({preventScroll:true});
+    el.setSelectionRange(at,at+find.length);
+    scrollToMatch();
+    requestAnimationFrame(scrollToMatch);
+    setHint('Correspondência destacada. A seleção será mantida até você editar o arquivo.');
+  }
   function replaceOne(){if(readOnly)return;const el=textarea.current;if(!find)return;const start=el.selectionStart,end=el.selectionEnd;if(content.slice(start,end).toLowerCase()===find.toLowerCase()){const next=content.slice(0,start)+replace+content.slice(end);updateContent(next);requestAnimationFrame(()=>el.setSelectionRange(start,start+replace.length));setHint('Texto substituído.');}else findNext();}
   function replaceAll(){if(readOnly||!find)return;const escaped=find.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),rx=new RegExp(escaped,'gi');let count=0;while(rx.exec(content))count++;updateContent(content.replace(rx,replace));setHint(`${count} ocorrência(s) substituída(s).`);}
   useEffect(()=>{const keydown=e=>{if(document.activeElement!==textarea.current)return;if((e.ctrlKey||e.metaKey)&&!e.altKey&&e.key.toLowerCase()==='f'){e.preventDefault();e.stopImmediatePropagation();document.getElementById('cfg-find')?.focus();}else if((e.ctrlKey||e.metaKey)&&!e.altKey&&e.key.toLowerCase()==='r'){e.preventDefault();e.stopImmediatePropagation();document.getElementById('cfg-replace')?.focus();}};window.addEventListener('keydown',keydown,true);return()=>window.removeEventListener('keydown',keydown,true);},[content]);

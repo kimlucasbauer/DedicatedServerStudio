@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.8 — 2026-10-18
+
+### Fixed
+
+- Scroll the BepInEx text editor to each search result and keep the match highlighted until the file is edited.
+- Hide offline player entries that only show a platform ID and have less than one displayed minute of playtime.
+
 ## 0.4.7 — 2026-10-18
 
 ### Added
