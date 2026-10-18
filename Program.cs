@@ -39,7 +39,9 @@ builder.Services.AddAntiforgery(options => options.HeaderName = "X-DSS-CSRF");
 builder.Services.AddSingleton<StateStore>();
 builder.Services.AddSingleton<ProviderCredentialVault>();
 builder.Services.AddSingleton<AuthService>();
+#if DSS_UPDATER_ENABLED
 builder.Services.AddSingleton<DssUpdateProgressStore>();
+#endif
 builder.Services.AddSingleton<IGameAdapter, ValheimGameAdapter>();
 builder.Services.AddSingleton<GameAdapterRegistry>();
 builder.Services.AddSingleton<WindowsFirewallService>();
@@ -77,12 +79,14 @@ builder.Services.AddHttpClient("public-ip", client =>
     client.Timeout = TimeSpan.FromSeconds(4);
     client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
 });
+#if DSS_UPDATER_ENABLED
 builder.Services.AddHttpClient<GitHubReleaseService>(client =>
 {
     client.Timeout = TimeSpan.FromSeconds(45);
     client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
     client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
 });
+#endif
 builder.Services.AddSingleton<R2ModmanProfileService>();
 
 var app = builder.Build();
@@ -96,7 +100,9 @@ if (!isFirstInstance)
 
 var state = app.Services.GetRequiredService<StateStore>();
 var auth = app.Services.GetRequiredService<AuthService>();
+#if DSS_UPDATER_ENABLED
 var updateProgress = app.Services.GetRequiredService<DssUpdateProgressStore>();
+#endif
 if (listenMode != "local" && await state.ReadAsync(data => string.IsNullOrWhiteSpace(data.AdminPasswordHash)))
     throw new InvalidOperationException("Set up the administrator password on localhost before enabling LAN or public access.");
 
@@ -194,7 +200,9 @@ var modPackages = app.Services.GetRequiredService<ModPackageManager>();
 var playerManagement = app.Services.GetRequiredService<PlayerManagementService>();
 var hostMetrics = app.Services.GetRequiredService<HostMetricsService>();
 var r2modmanProfiles = app.Services.GetRequiredService<R2ModmanProfileService>();
+#if DSS_UPDATER_ENABLED
 var githubReleases = app.Services.GetRequiredService<GitHubReleaseService>();
+#endif
 
 var elevationStartupId = Guid.NewGuid().ToString("N");
 var appVersion = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "0.0.0";
@@ -322,6 +330,7 @@ async Task<IResult> ChangeElevationAsync(bool enabled, HttpContext context)
 app.MapPost("/api/app/elevation/enable", (Delegate)(Func<HttpContext, Task<IResult>>)(context => ChangeElevationAsync(true, context)));
 app.MapPost("/api/app/elevation/disable", (Delegate)(Func<HttpContext, Task<IResult>>)(context => ChangeElevationAsync(false, context)));
 
+#if DSS_UPDATER_ENABLED
 app.MapGet("/api/app/update", async (HttpContext context, CancellationToken cancellationToken) =>
 {
     if (!await RequireAdmin(context, auth, state)) return Results.Forbid();
@@ -495,6 +504,7 @@ app.MapGet("/api/app/update/progress", async (Guid? operationId, HttpContext con
     var progress = updateProgress.Get(operationId);
     return progress is null ? Results.NotFound() : Results.Ok(progress);
 });
+#endif
 
 app.MapPut("/api/settings/access", async (ListenModeInput input, HttpContext context) =>
 {
@@ -540,6 +550,11 @@ app.MapPut("/api/settings/access", async (ListenModeInput input, HttpContext con
         startInfo.ArgumentList.Add("-WaitForExistingInstance");
         startInfo.ArgumentList.Add("-PreviousProcessId");
         startInfo.ArgumentList.Add(Environment.ProcessId.ToString());
+        if (int.TryParse(Environment.GetEnvironmentVariable("DSS_LAUNCHER_PID"), out var previousLauncherProcessId) && previousLauncherProcessId > 0)
+        {
+            startInfo.ArgumentList.Add("-PreviousLauncherProcessId");
+            startInfo.ArgumentList.Add(previousLauncherProcessId.ToString());
+        }
         startInfo.ArgumentList.Add("-ListenMode");
         startInfo.ArgumentList.Add(requestedMode);
         startInfo.ArgumentList.Add("-StartupSignalPath");
@@ -1193,14 +1208,21 @@ app.MapGet("/api/instances/{id:guid}/access", async (Guid id, HttpContext contex
     {
         var profile = data.Instances.FirstOrDefault(item => item.Id == id);
         if (profile is null) return (Found: false, UserIds: Array.Empty<Guid>(), UserAccess: new Dictionary<Guid, string>(), Users: Array.Empty<UserView>());
-        var userAccess = profile.UserAccess.ToDictionary(pair => pair.Key, pair => pair.Value);
+        // Ignore stale grants left by older state files (for example, a user removed
+        // before profile access cleanup existed). Returning them would put hidden IDs
+        // into the editor draft, and the save endpoint would reject the whole update.
+        var availableUsers = data.Users.Where(user => user.Role != "admin").ToArray();
+        var availableIds = availableUsers.Select(user => user.Id).ToHashSet();
+        var userAccess = profile.UserAccess
+            .Where(pair => availableIds.Contains(pair.Key))
+            .ToDictionary(pair => pair.Key, pair => pair.Value);
         foreach (var legacyUserId in profile.AllowedUserIds)
-            userAccess.TryAdd(legacyUserId, "edit");
+            if (availableIds.Contains(legacyUserId)) userAccess.TryAdd(legacyUserId, "edit");
         var selected = userAccess.Keys.ToHashSet();
-        var users = data.Users.Where(user => user.Role != "admin" && (includeAvailable || selected.Contains(user.Id)))
+        var users = availableUsers.Where(user => includeAvailable || selected.Contains(user.Id))
             .OrderBy(user => user.Username).Select(user => new UserView(user.Id, user.Username, user.Role, user.CreatedAt, 0,
                 GetUserImageUrl(state.DataDirectory, user.Id))).ToArray();
-        return (Found: true, UserIds: profile.AllowedUserIds.ToArray(), UserAccess: userAccess, Users: users);
+        return (Found: true, UserIds: userAccess.Keys.ToArray(), UserAccess: userAccess, Users: users);
     });
     return !access.Found ? Results.NotFound() : Results.Ok(new { userIds = access.UserIds, userAccess = access.UserAccess, users = access.Users });
 });

@@ -1972,3 +1972,5 @@ select.field:focus-visible{border-color:#83ad60;box-shadow:0 0 0 3px #a8dd7520}
 [data-read-only="true"] .modal-head button.icon-btn{pointer-events:auto!important;cursor:pointer!important;opacity:1!important}
 .modal-card.profile-access-editor-modal{width:min(88vw,1080px);min-height:min(56vh,520px);max-height:88vh}
 @media(max-width:700px){.modal-card.profile-access-editor-modal{width:calc(100vw - 28px);min-height:min(62vh,520px);max-height:calc(100vh - 24px)}}
+.editor-codepane .config-textarea::selection { background: #d7b94c99; }
+.editor-codepane.large-config-plain .config-textarea { color: #c8d5d9; -webkit-text-fill-color: currentColor; }

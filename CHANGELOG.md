@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.7 — 2026-10-18
+
+### Added
+
+- Add separate GitHub and Nexus package builds; the Nexus variant excludes the DSS self-updater while the GitHub variant keeps it.
+- Add an offline manual updater command that validates and installs a DSS ZIP placed in `.dss-builds`, and include that update folder in every package.
+- Show a persistent search selection in the BepInEx text editor and add comment tooltips to recognized fields.
+- Open large BepInEx configuration files in a lightweight text mode that skips full-file syntax rendering, line gutters, and visual diff calculation to reduce browser memory use.
+
+### Fixed
+
+- Complete network-access restarts when the previous DSS host has exited but its verified PowerShell launcher still holds the startup lock.
+- Ignore stale profile access entries for users who were removed or changed to administrators, so hidden grants cannot block saving current access assignments.
+- Hide inactive player roster entries that only show a platform ID and have no recorded playtime.
+- Make BepInEx search wrap through the current file, scroll to each match, and highlight the selected text until the file is edited; count bulk replacements without allocating a match array.
+
 ## 0.4.6 — 2026-10-17
 
 ### Added

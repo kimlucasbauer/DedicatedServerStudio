@@ -7,7 +7,9 @@
     <AssemblyName>DedicatedServerStudio</AssemblyName>
     <RootNamespace>DedicatedServerStudio</RootNamespace>
     <Product>Dedicated Server Studio</Product>
-    <Version>0.4.6</Version>
+    <Version>0.4.7</Version>
+    <DssUpdaterEnabled Condition="'$(DssUpdaterEnabled)' == ''">true</DssUpdaterEnabled>
+    <DefineConstants Condition="'$(DssUpdaterEnabled)' != 'false'">$(DefineConstants);DSS_UPDATER_ENABLED</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
@@ -19,6 +21,12 @@
     <!-- The Vite build emits the only frontend artifacts DSS serves. Keep React sources out of the web package. -->
     <Content Remove="frontend\**;publish\**;release\**;dss-config.json" />
     <None Remove="frontend\**;publish\**;release\**;dss-config.json" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(DssUpdaterEnabled)' == 'false'">
+    <!-- Nexus excludes the automatic update client; publish.ps1 separately includes the offline ZIP helper. -->
+    <Compile Remove="Services\GitHubReleaseService.cs;Services\DssUpdateProgressStore.cs" />
+    <None Remove="apply-update.ps1" />
   </ItemGroup>
 
 </Project>

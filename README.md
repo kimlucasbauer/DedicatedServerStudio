@@ -10,11 +10,12 @@ See [CHANGELOG.md](CHANGELOG.md) for additions and adjustments in each release.
 
 - Organize servers into profiles. A profile can contain multiple Valheim servers that share one game installation and mod setup while keeping each world's public name, world, port, saves, startup options, and console separate.
 - Install and update Valheim Dedicated Server through SteamCMD, including supported server branches. The panel shows installation progress and the installed build when it can be read from the game files.
-- Search the Thunderstore, Hexium, Nexus Mods, and CurseForge catalogs; review dependency and version requirements; install mods; import r2modman profiles; and edit BepInEx configuration files.
+- Search the Thunderstore, Hexium, Nexus Mods, and CurseForge catalogs; review dependency and version requirements; install mods; import r2modman profiles; and edit BepInEx configuration files in text or structured-fields mode.
 - Start, stop, restart, and monitor servers, with resource and player status where the server exposes that information.
 - View each server's recent console output, copy it, or download the complete current log. The on-screen console keeps the latest 1,000 lines to stay responsive.
 - Review per-profile activity, compare configuration changes, and inspect mod versions and managed files.
 - Manage recognized players, access lists, and supported live actions, including admin, permitted, banned, and kick operations.
+- Keep the player roster focused on named characters or entries with recorded playtime; inactive ID-only records with no playtime are hidden.
 - Check local and public addresses and test whether a running server answers a network query.
 - Create DSS user accounts and grant profile-specific permissions: editors have administrator-equivalent access within assigned profiles, while operators can manage server operations and view profile information without changing profile configuration. The built-in `admin` account always remains an administrator.
 - Choose an interface language for each account: English, Brazilian Portuguese, Spanish, French, German, Russian, or Simplified Chinese. English is used until an account saves a different preference under **Settings → Preferences**.
@@ -69,6 +70,10 @@ Administrators can assign people to profiles with `operate` or `edit` access. A 
 
 When importing a r2modman profile, each supported configuration file can be up to 10 MB; the .r2z archive remains limited to 25 MB, with a 30 MB total configuration limit.
 
+## BepInEx configuration editor
+
+The editor supports syntax-colored text and structured fields for recognized `.cfg` settings. In fields mode, hover over a setting to read its adjacent comments as a tooltip. Text search selects and scrolls to each match, wraps to the start of the file, and keeps the match highlighted until you edit the file. Configurations over 512 KB or 4,000 lines open in lightweight text mode; syntax coloring, line-by-line comparison, and structured fields are disabled for those files to keep browser memory use manageable. Saving and text search remain available.
+
 ## Administrator mode and network access
 
 DSS starts in standard Windows mode by default and does not request administrator privileges. In standard mode, it can manage and start servers, but Windows may block incoming game connections until the firewall is configured.
@@ -95,9 +100,17 @@ Valheim is the only game adapter currently available. Some status and player det
 
 ## Automatic updates
 
-When an administrator signs in, DSS checks the latest public GitHub Release for this repository. If a newer version is available, the update button appears beside the DSS logo. Review the formatted release notes and confirm the update in the dialog to see live progress through download, extraction, validation, staging, backup, installation, restart, and startup confirmation. DSS prepares and verifies the complete new version before stopping the panel, then launches the updated version in a PowerShell window. The updater preserves `dss-config.json`, profiles, user sessions, server files, credentials, and logs. Servers with a persistent console bridge remain running while the panel restarts; DSS also attempts to reconnect to existing server processes after a panel restart or reinstallation. If an older server process has no persistent bridge, DSS asks you to restart it once before updating. During a panel restart, DSS can close the verified previous host if it fails to exit, provided no other process owns the listening port. Wait for SteamCMD operations to finish before confirming an update.
+The GitHub package includes a DSS self-updater. When an administrator signs in, it checks the latest public GitHub Release for this repository. If a newer version is available, the update button appears beside the DSS logo. Review the formatted release notes and confirm the update in the dialog to see live progress through download, extraction, validation, staging, backup, installation, restart, and startup confirmation. DSS prepares and verifies the complete new version before stopping the panel, then launches the updated version in a PowerShell window. The updater preserves `dss-config.json`, profiles, user sessions, server files, credentials, and logs. Servers with a persistent console bridge remain running while the panel restarts; DSS also attempts to reconnect to existing server processes after a panel restart or reinstallation. If an older server process has no persistent bridge, DSS asks you to restart it once before updating. During a panel restart, DSS can close the verified previous host if it fails to exit, provided no other process owns the listening port. Wait for SteamCMD operations to finish before confirming an update. The Nexus package has no automatic DSS updater.
+
+### Manual update from a local ZIP
+
+Place one official `DedicatedServerStudio-<version>-production.zip` or `DedicatedServerStudio-<version>-nexus.zip` in the `.dss-builds` folder beside `DSS.cmd`, then run `DSS-ManualUpdate.cmd`. The command asks for confirmation, verifies and prepares the package while the dashboard is still available, and then restarts DSS to replace the application files. If DSS is running, the updater closes the verified DSS host during the final replacement. Keep the update ZIP in `.dss-builds`; the command preserves it after the update. Profile data, settings, server files, and logs are kept.
 
 Releases use semantic-version tags and attach a matching production package named `DedicatedServerStudio-<version>-production.zip` (for example, tag `v0.4.4` pairs with `DedicatedServerStudio-0.4.4-production.zip`). The production package omits machine-specific `dss-config.json`; a fresh install creates that file with `runAsAdministrator: false` on first launch, while an existing configuration is left untouched during manual extraction. DSS checks the package SHA-256 when GitHub provides its release-asset digest, validates the runtime manifest, and keeps a temporary copy of application files so it can restore them if the new build does not start. Run `DSS-ForceStop.cmd` as Administrator to force-stop the DSS process listening on its default port (5089).
+
+### Publishing packages
+
+Build the GitHub package with the DSS self-updater using `.\publish.ps1 -PackageFlavor GitHub`. Build the Nexus package without the automatic updater UI, API endpoints, or GitHub release client using `.\publish.ps1 -PackageFlavor Nexus`; both package flavors include the offline manual ZIP updater. Use `.\publish.ps1 -PackageFlavor Both` to create both ZIPs locally; the script does not publish or upload them. The GitHub ZIP is named `DedicatedServerStudio-<version>-production.zip`, and the Nexus ZIP is named `DedicatedServerStudio-<version>-nexus.zip`.
 
 ## License
 

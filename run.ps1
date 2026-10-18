@@ -6,6 +6,7 @@
     [string]$AssemblyPath,
     [switch]$WaitForExistingInstance,
     [int]$PreviousProcessId = 0,
+    [int]$PreviousLauncherProcessId = 0,
     [string]$StartupSignalPath,
     [switch]$RequireNonAdministrator,
     [switch]$PauseOnFailure
@@ -49,6 +50,19 @@ function Test-DssProcessIdentity([int]$ProcessId) {
             ($command -match 'DedicatedServerStudio(?:\.dll|\.exe)')
         return $belongsToDss -and $isDssHost
     } catch { return $false }
+}
+
+function Test-DssLauncherIdentity([int]$ProcessId) {
+    if ($ProcessId -le 0) { return $false }
+    try {
+        $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop
+        if ($null -eq $processInfo -or $processInfo.Name -notin @('powershell.exe', 'pwsh.exe')) { return $false }
+        $expectedScript = [IO.Path]::GetFullPath((Join-Path $projectRoot 'run.ps1'))
+        $command = [string]$processInfo.CommandLine
+        return $command -and $command.IndexOf($expectedScript, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+            $command -match '(?i)(?:^|\s)-File(?:\s|$)'
+    }
+    catch { return $false }
 }
 
 function Stop-StaleDssLauncher([datetime]$OlderThan) {
@@ -194,6 +208,7 @@ try {
         $waitUntil = $waitStarted.AddSeconds(120)
         $forceStopAfter = $waitStarted.AddSeconds(8)
         $nextStaleLauncherCheck = $waitStarted.AddSeconds(20)
+        $nextPreviousLauncherCheck = $waitStarted.AddSeconds(10)
         $forceStopAttempted = $false
         $previousProcess = $null
         if ($PreviousProcessId -gt 0) {
@@ -279,6 +294,15 @@ try {
                 try { $ownsLaunchMutex = $launchMutex.WaitOne(150) }
                 catch [Threading.AbandonedMutexException] { $ownsLaunchMutex = $true }
                 if ($ownsLaunchMutex) { break }
+                if ($PreviousLauncherProcessId -gt 0 -and -not (Test-DssProcessIdentity $PreviousProcessId) -and (Get-Date) -ge $nextPreviousLauncherCheck) {
+                    $nextPreviousLauncherCheck = (Get-Date).AddSeconds(5)
+                    if (Test-DssLauncherIdentity $PreviousLauncherProcessId) {
+                        Write-LaunchMessage "The previous DSS host and listener are closed, but its verified launcher (PID $PreviousLauncherProcessId) still holds the startup lock. Closing that launcher so startup can continue."
+                        Stop-Process -Id $PreviousLauncherProcessId -Force -ErrorAction Stop
+                        Start-Sleep -Milliseconds 100
+                        continue
+                    }
+                }
                 if ((Get-Date) -ge $nextStaleLauncherCheck) {
                     $null = Stop-StaleDssLauncher $waitStarted.AddSeconds(-15)
                     $nextStaleLauncherCheck = (Get-Date).AddSeconds(5)

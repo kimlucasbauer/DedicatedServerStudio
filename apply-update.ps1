@@ -7,7 +7,8 @@ param(
     [int]$CurrentLauncherProcessId = 0,
     [Parameter(Mandatory)][ValidateRange(1, 65535)][int]$Port,
     [Parameter(Mandatory)][string]$ProgressPath,
-    [Parameter(Mandatory)][Guid]$OperationId
+    [Parameter(Mandatory)][Guid]$OperationId,
+    [switch]$KeepArchive
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,7 +35,8 @@ $buildDirectory = $null
 $archiveHandle = $null
 $allowedFiles = @(
     'appsettings.json', 'DedicatedServerStudio.staticwebassets.endpoints.json',
-    'dss-runtime.json', 'DSS.cmd', 'DSS-ForceStop.cmd', 'run.ps1', 'apply-update.ps1', 'README.md', 'LICENSE', 'web.config'
+    'dss-runtime.json', 'DSS.cmd', 'DSS-ForceStop.cmd', 'run.ps1', 'apply-update.ps1', 'README.md', 'LICENSE', 'web.config',
+    'CHANGELOG.md', 'DSS-ManualUpdate.cmd', 'DSS-ManualUpdate.ps1'
 )
 
 function Write-UpdateLog([string]$Message) {
@@ -308,7 +310,7 @@ try {
     $archiveHandle.Dispose(); $archiveHandle = $null
     Write-UpdateProgress 'extracting' 57 'Pacote extraído'
 
-    foreach ($required in @('DedicatedServerStudio.dll', 'DedicatedServerStudio.deps.json', 'DedicatedServerStudio.runtimeconfig.json', 'dss-runtime.json', 'run.ps1', 'DSS.cmd', 'DSS-ForceStop.cmd', 'apply-update.ps1', 'wwwroot\index.html')) {
+    foreach ($required in @('DedicatedServerStudio.dll', 'DedicatedServerStudio.deps.json', 'DedicatedServerStudio.runtimeconfig.json', 'dss-runtime.json', 'run.ps1', 'DSS.cmd', 'DSS-ForceStop.cmd', 'apply-update.ps1', 'DSS-ManualUpdate.cmd', 'DSS-ManualUpdate.ps1', 'wwwroot\index.html')) {
         if (-not (Test-Path -LiteralPath (Join-Path $extract $required) -PathType Leaf)) { throw "The update archive is missing required file $required." }
     }
     Write-UpdateProgress 'validating' 58 'Validando a versão e os arquivos extraídos'
@@ -430,7 +432,7 @@ try {
     Write-UpdateLog "DSS v$ExpectedVersion is responding. Update completed."
     Write-UpdateProgress 'completed' 100 'DSS atualizado e pronto'
     if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force }
-    if (Test-Path -LiteralPath $archive) { Remove-Item -LiteralPath $archive -Force }
+    if (-not $KeepArchive -and (Test-Path -LiteralPath $archive)) { Remove-Item -LiteralPath $archive -Force }
 }
 catch {
     Write-UpdateLog "Update failed: $($_.Exception.Message)"
@@ -448,7 +450,7 @@ catch {
     if (-not $installationStarted -and $buildDirectory -and (Test-Path -LiteralPath $buildDirectory)) {
         try { Remove-Item -LiteralPath $buildDirectory -Recurse -Force } catch {}
     }
-    if (Test-Path -LiteralPath $archive) { try { Remove-Item -LiteralPath $archive -Force } catch {} }
+    if (-not $KeepArchive -and (Test-Path -LiteralPath $archive)) { try { Remove-Item -LiteralPath $archive -Force } catch {} }
     exit 1
 }
 finally {
