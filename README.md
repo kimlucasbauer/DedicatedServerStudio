@@ -98,9 +98,13 @@ Removing a profile keeps its game files and saves unless you explicitly select t
 
 Valheim is the only game adapter currently available. Some status and player details depend on the game server's output and may not be available when a server is stopped. DSS is a local management panel; it does not provide game hosting, a public relay, or router configuration.
 
-## Automatic updates
+## DSS updates
 
-The GitHub package includes a DSS self-updater. When an administrator signs in, it checks the latest public GitHub Release for this repository. If a newer version is available, the update button appears beside the DSS logo. Review the formatted release notes and confirm the update in the dialog to see live progress through download, extraction, validation, staging, backup, installation, restart, and startup confirmation. DSS prepares and verifies the complete new version before stopping the panel, then launches the updated version in a PowerShell window. The updater preserves `dss-config.json`, profiles, user sessions, server files, credentials, and logs. Servers with a persistent console bridge remain running while the panel restarts; DSS also attempts to reconnect to existing server processes after a panel restart or reinstallation. If an older server process has no persistent bridge, DSS asks you to restart it once before updating. During a panel restart, DSS can close the verified previous host if it fails to exit, provided no other process owns the listening port. Wait for SteamCMD operations to finish before confirming an update. The Nexus package has no automatic DSS updater.
+The GitHub package checks the latest public GitHub Release for this repository when an administrator signs in. The update button beside the DSS logo opens the release details and live progress through download, extraction, validation, staging, backup, installation, restart, and startup confirmation. DSS prepares and verifies the complete new version before stopping the panel, then launches the updated version in a PowerShell window.
+
+The Nexus package does not connect to GitHub or use its release API. Its update button checks only for official versioned ZIP files in `.dss-builds` beside `DSS.cmd`. Place `DedicatedServerStudio-<version>-production.zip` or `DedicatedServerStudio-<version>-nexus.zip` in that folder; the panel lists available versions newer than the installed build so you can choose a ZIP. The selected package uses the same validation, backup, progress, and final-step restart flow. It never downloads an update from GitHub.
+
+Both update flows preserve `dss-config.json`, profiles, user sessions, server files, credentials, and logs. Servers with a persistent console bridge remain running while the panel restarts; DSS also attempts to reconnect to existing server processes after a panel restart or reinstallation. If an older server process has no persistent bridge, DSS asks you to restart it once before updating. During a panel restart, DSS can close the verified previous host if it fails to exit, provided no other process owns the listening port. Wait for SteamCMD operations to finish before confirming an update.
 
 ### Manual update from a local ZIP
 
@@ -110,7 +114,7 @@ Releases use semantic-version tags and attach a matching production package name
 
 ### Publishing packages
 
-Build the GitHub package with the DSS self-updater using `.\publish.ps1 -PackageFlavor GitHub`. Build the Nexus package without the automatic updater UI, API endpoints, or GitHub release client using `.\publish.ps1 -PackageFlavor Nexus`; both package flavors include the offline manual ZIP updater. Use `.\publish.ps1 -PackageFlavor Both` to create both ZIPs locally; the script does not publish or upload them. The GitHub ZIP is named `DedicatedServerStudio-<version>-production.zip`, and the Nexus ZIP is named `DedicatedServerStudio-<version>-nexus.zip`.
+Build the GitHub package with GitHub Release checks using `.\publish.ps1 -PackageFlavor GitHub`. Build the Nexus package with local-only update checks and no GitHub release client/API using `.\publish.ps1 -PackageFlavor Nexus`; both packages include `DSS-ManualUpdate.cmd` as an offline fallback. Use `.\publish.ps1 -PackageFlavor Both` to create both ZIPs locally; the script does not publish or upload them. The GitHub ZIP is named `DedicatedServerStudio-<version>-production.zip`, and the Nexus ZIP is named `DedicatedServerStudio-<version>-nexus.zip`.
 
 ## License
 

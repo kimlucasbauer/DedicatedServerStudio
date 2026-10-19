@@ -34,7 +34,7 @@ public sealed class DssUpdateProgressStore(StateStore state)
                 throw new InvalidOperationException("Uma atualização do DSS já está em andamento.");
 
             var update = new DssUpdateProgress(Guid.NewGuid(), version, "checking", 3,
-                "Release validada. Preparando o download…", null, null, null, DateTimeOffset.UtcNow);
+                "Pacote selecionado. Preparando a atualização…", null, null, null, DateTimeOffset.UtcNow);
             WriteUnsafe(update);
             return update;
         }

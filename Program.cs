@@ -6,8 +6,10 @@ using System.Net.NetworkInformation;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Runtime.Versioning;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using System.Threading.Channels;
 using Microsoft.AspNetCore.Antiforgery;
 using Microsoft.AspNetCore.Mvc;
@@ -39,9 +41,7 @@ builder.Services.AddAntiforgery(options => options.HeaderName = "X-DSS-CSRF");
 builder.Services.AddSingleton<StateStore>();
 builder.Services.AddSingleton<ProviderCredentialVault>();
 builder.Services.AddSingleton<AuthService>();
-#if DSS_UPDATER_ENABLED
 builder.Services.AddSingleton<DssUpdateProgressStore>();
-#endif
 builder.Services.AddSingleton<IGameAdapter, ValheimGameAdapter>();
 builder.Services.AddSingleton<GameAdapterRegistry>();
 builder.Services.AddSingleton<WindowsFirewallService>();
@@ -52,7 +52,7 @@ builder.Services.AddSingleton<PlayerManagementService>();
 builder.Services.AddHttpClient("steamcmd", client =>
 {
     client.Timeout = TimeSpan.FromMinutes(10);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.9");
 });
 builder.Services.AddSingleton<SteamCmdService>();
 builder.Services.AddHostedService(provider => provider.GetRequiredService<SteamCmdService>());
@@ -62,28 +62,28 @@ builder.Services.AddSingleton<ModPackageManager>();
 builder.Services.AddHttpClient("catalog", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(18);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.9");
 });
 builder.Services.AddHttpClient("mod-download", client =>
 {
     client.Timeout = Timeout.InfiniteTimeSpan;
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.9");
 });
 builder.Services.AddHttpClient("r2modman", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(45);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.9");
 });
 builder.Services.AddHttpClient("public-ip", client =>
 {
     client.Timeout = TimeSpan.FromSeconds(4);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.9");
 });
 #if DSS_UPDATER_ENABLED
 builder.Services.AddHttpClient<GitHubReleaseService>(client =>
 {
     client.Timeout = TimeSpan.FromSeconds(45);
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.2");
+    client.DefaultRequestHeaders.UserAgent.ParseAdd("DedicatedServerStudio/0.4.9");
     client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.github+json"));
 });
 #endif
@@ -100,9 +100,7 @@ if (!isFirstInstance)
 
 var state = app.Services.GetRequiredService<StateStore>();
 var auth = app.Services.GetRequiredService<AuthService>();
-#if DSS_UPDATER_ENABLED
 var updateProgress = app.Services.GetRequiredService<DssUpdateProgressStore>();
-#endif
 if (listenMode != "local" && await state.ReadAsync(data => string.IsNullOrWhiteSpace(data.AdminPasswordHash)))
     throw new InvalidOperationException("Set up the administrator password on localhost before enabling LAN or public access.");
 
@@ -497,6 +495,176 @@ app.MapPost("/api/app/update/install", async (HttpContext context, CancellationT
     }
 });
 
+#endif
+
+#if !DSS_UPDATER_ENABLED
+List<(FileInfo File, Version Version, string VersionText)> GetLocalDssPackages()
+{
+    var buildsDirectory = Path.Combine(app.Environment.ContentRootPath, ".dss-builds");
+    if (!Directory.Exists(buildsDirectory)) return [];
+    return Directory.EnumerateFiles(buildsDirectory, "DedicatedServerStudio-*.zip", SearchOption.TopDirectoryOnly)
+        .Select(path => new FileInfo(path))
+        .Select(file =>
+        {
+            var match = Regex.Match(file.Name, "^DedicatedServerStudio-(\\d+\\.\\d+\\.\\d+)-(production|nexus)\\.zip$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+            return match.Success && Version.TryParse(match.Groups[1].Value, out var version)
+                ? (File: file, Version: version, VersionText: version.ToString(3))
+                : ((FileInfo File, Version Version, string VersionText)?)null;
+        })
+        .Where(package => package.HasValue)
+        .Select(package => package!.Value)
+        .OrderByDescending(package => package.File.LastWriteTimeUtc)
+        .ToList();
+}
+
+var localBuildsDirectory = Path.Combine(app.Environment.ContentRootPath, ".dss-builds");
+app.MapGet("/api/app/update/local", async (HttpContext context) =>
+{
+    if (!await RequireAdmin(context, auth, state)) return Results.Forbid();
+    var current = Version.TryParse(appVersion, out var parsedCurrent) ? parsedCurrent : new Version(0, 0, 0);
+    var packages = GetLocalDssPackages().Where(package => package.Version > current).ToList();
+    var candidate = packages.FirstOrDefault();
+    var candidateFile = candidate.File;
+    var hasCandidate = candidateFile is not null;
+    var candidateVersion = hasCandidate ? candidate.VersionText : appVersion;
+    return Results.Ok(new
+    {
+        currentVersion = appVersion,
+        updateAvailable = hasCandidate,
+        latestVersion = candidateVersion,
+        releaseName = hasCandidate ? $"Dedicated Server Studio {candidateVersion}" : "Versões locais do DSS",
+        releasePageUrl = (string?)null,
+        releaseNotes = (string?)null,
+        publishedAt = candidateFile is null ? (DateTimeOffset?)null : new DateTimeOffset(candidateFile.LastWriteTimeUtc, TimeSpan.Zero),
+        packageAvailable = hasCandidate,
+        packageName = candidateFile?.Name,
+        packageSize = candidateFile?.Length,
+        source = "local",
+        localBuildsDirectory = ".dss-builds",
+        availablePackages = packages.Take(50).Select(package => new { version = package.VersionText, packageName = package.File.Name, packageSize = package.File.Length, lastModified = package.File.LastWriteTimeUtc })
+    });
+});
+
+app.MapPost("/api/app/update/local/install", async (HttpContext context) =>
+{
+    if (!await RequireAdmin(context, auth, state)) return Results.Forbid();
+    if (!OperatingSystem.IsWindows()) return Results.BadRequest(new { error = "A atualização local do DSS está disponível somente no Windows." });
+
+    var profiles = await state.ReadAsync(data => data.Instances.ToArray());
+    var activeServerWithoutBridge = profiles
+        .SelectMany(profile => profile.Servers.Count == 0 ? [profile] : profile.Servers.Select(profile.WithServer))
+        .FirstOrDefault(server =>
+        {
+            var status = supervisor.GetStatus(server.Id);
+            return status is "starting" or "stopping" || status == "running" && !supervisor.IsConsoleConnected(server.Id);
+        });
+    if (activeServerWithoutBridge is not null)
+    {
+        var serverStatus = supervisor.GetStatus(activeServerWithoutBridge.Id);
+        var error = serverStatus is "starting" or "stopping"
+            ? $"Aguarde o servidor '{activeServerWithoutBridge.ServerName}' terminar de iniciar ou parar antes de atualizar o painel."
+            : $"O servidor '{activeServerWithoutBridge.ServerName}' não tem uma ponte de console persistente disponível. Reinicie-o uma vez nesta versão do DSS antes de atualizar o painel; depois, console e Gestão poderão se reconectar sem reiniciar o jogo.";
+        return Results.Conflict(new { error });
+    }
+    if (profiles.Any(profile => steamCmd.GetOperation(profile.Id)?.Running == true))
+        return Results.Conflict(new { error = "Aguarde a operação do SteamCMD terminar antes de atualizar o DSS." });
+
+    string? archivePath = null;
+    try
+    {
+        var current = Version.TryParse(appVersion, out var parsedCurrent) ? parsedCurrent : new Version(0, 0, 0);
+        var request = await context.Request.ReadFromJsonAsync<JsonObject>();
+        var selectedPackageName = request?["packageName"]?.ToString();
+        var newerPackages = GetLocalDssPackages().Where(item => item.Version > current).ToList();
+        var package = string.IsNullOrWhiteSpace(selectedPackageName)
+            ? newerPackages.FirstOrDefault()
+            : newerPackages.FirstOrDefault(item => string.Equals(item.File.Name, selectedPackageName, StringComparison.OrdinalIgnoreCase));
+        if (package.File is null)
+            return Results.Conflict(new { error = "O ZIP selecionado não está disponível ou não contém uma versão mais recente em .dss-builds. Verifique o pacote e tente novamente." });
+
+        var projectRoot = Path.GetFullPath(app.Environment.ContentRootPath);
+        var buildsRoot = Path.GetFullPath(localBuildsDirectory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        archivePath = Path.GetFullPath(package.File.FullName);
+        if (!archivePath.StartsWith(buildsRoot, StringComparison.OrdinalIgnoreCase) || !File.Exists(archivePath))
+            return Results.BadRequest(new { error = "O pacote local selecionado não está dentro da pasta .dss-builds." });
+
+        var helperPath = Path.Combine(projectRoot, "apply-update.ps1");
+        if (!File.Exists(helperPath))
+            return Results.Problem("O atualizador local desta instalação está ausente. Reinstale o pacote oficial do DSS.", statusCode: 500);
+
+        var progress = updateProgress.Begin(package.VersionText);
+        var operationId = progress.OperationId;
+        var progressPath = updateProgress.ProgressFilePath;
+        var selectedArchivePath = archivePath;
+        var selectedVersion = package.VersionText;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var fileInfo = new FileInfo(selectedArchivePath);
+                updateProgress.Report(operationId, "verifying", 5, "Verificando o ZIP local", 0, fileInfo.Length);
+                await using var archiveStream = new FileStream(selectedArchivePath, FileMode.Open, FileAccess.Read, FileShare.Read);
+                var sha256 = Convert.ToHexString(await SHA256.HashDataAsync(archiveStream, CancellationToken.None));
+                updateProgress.Report(operationId, "verifying", 8, "Pacote local verificado", fileInfo.Length, fileInfo.Length);
+                var currentLauncherProcessId = int.TryParse(Environment.GetEnvironmentVariable("DSS_LAUNCHER_PID"), out var launcherPid) && launcherPid > 0 ? launcherPid : 0;
+                var powerShellPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe");
+                if (!File.Exists(powerShellPath)) throw new FileNotFoundException("Windows PowerShell não foi encontrado.", powerShellPath);
+                var startInfo = new ProcessStartInfo
+                {
+                    FileName = powerShellPath,
+                    WorkingDirectory = projectRoot,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                foreach (var argument in new[]
+                {
+                    "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helperPath,
+                    "-ProjectRoot", projectRoot, "-ArchivePath", selectedArchivePath, "-ExpectedVersion", selectedVersion,
+                    "-ExpectedSha256", sha256, "-CurrentProcessId", Environment.ProcessId.ToString(), "-Port", listenPort.ToString(),
+                    "-CurrentLauncherProcessId", currentLauncherProcessId.ToString(), "-ProgressPath", progressPath,
+                    "-OperationId", operationId.ToString("D"), "-KeepArchive"
+                }) startInfo.ArgumentList.Add(argument);
+                using var updater = Process.Start(startInfo) ?? throw new InvalidOperationException("Não foi possível iniciar o processo de atualização local.");
+                var preparationDeadline = DateTimeOffset.UtcNow.AddMinutes(15);
+                while (DateTimeOffset.UtcNow < preparationDeadline)
+                {
+                    var currentProgress = updateProgress.Get(operationId);
+                    if (currentProgress?.Phase == "waiting-for-shutdown")
+                    {
+                        app.Logger.LogInformation("Local DSS update {OperationId} is staged and validated; shutting down for installation.", operationId);
+                        app.Lifetime.StopApplication();
+                        return;
+                    }
+                    if (currentProgress?.Phase == "failed") return;
+                    if (updater.HasExited)
+                    {
+                        var message = $"O atualizador local encerrou antes de preparar a instalação (código {updater.ExitCode}). Consulte logs/dss-update-*.log.";
+                        app.Logger.LogError("Local DSS update helper exited before shutdown with code {ExitCode} for operation {OperationId}.", updater.ExitCode, operationId);
+                        updateProgress.Report(operationId, "failed", 100, "Falha ao preparar a atualização local", error: message);
+                        return;
+                    }
+                    await Task.Delay(250);
+                }
+                try { updater.Kill(entireProcessTree: true); } catch (InvalidOperationException) { }
+                updateProgress.Report(operationId, "failed", 100, "Tempo esgotado ao preparar a atualização", error: "A preparação excedeu 15 minutos. O painel permaneceu aberto e nenhum arquivo foi substituído.");
+            }
+            catch (Exception ex)
+            {
+                app.Logger.LogError(ex, "Could not prepare local DSS update operation {OperationId}", operationId);
+                updateProgress.Report(operationId, "failed", 100, "A atualização local falhou", error: ex.Message);
+            }
+        });
+        return Results.Accepted($"/api/app/update/progress?operationId={operationId:D}", progress);
+    }
+    catch (Exception ex) when (ex is InvalidDataException or IOException or InvalidOperationException or Win32Exception or UnauthorizedAccessException or JsonException)
+    {
+        app.Logger.LogError(ex, "Could not prepare local DSS update");
+        return Results.Problem("Não foi possível preparar a atualização local do DSS. " + ex.Message, statusCode: StatusCodes.Status500InternalServerError);
+    }
+});
+#endif
+
 app.MapGet("/api/app/update/progress", async (Guid? operationId, HttpContext context) =>
 {
     if (!await RequireAdmin(context, auth, state)) return Results.Forbid();
@@ -504,7 +672,6 @@ app.MapGet("/api/app/update/progress", async (Guid? operationId, HttpContext con
     var progress = updateProgress.Get(operationId);
     return progress is null ? Results.NotFound() : Results.Ok(progress);
 });
-#endif
 
 app.MapPut("/api/settings/access", async (ListenModeInput input, HttpContext context) =>
 {

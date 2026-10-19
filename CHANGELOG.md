@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.9 — 2026-10-19
+
+### Added
+
+- Give the Nexus package a local DSS update check. It lists official versioned ZIPs in `.dss-builds` for selection, clearly states that it does not contact GitHub, and uses the staged updater with progress and a final-step restart.
+
+### Fixed
+
+- Match BepInEx configuration files using package names and managed plugin assembly names, including package IDs that differ from the configuration filename.
+- Keep the mod version selector available for browsing while a server is running; applying a version remains disabled until the server is stopped.
+
 ## 0.4.8 — 2026-10-18
 
 ### Fixed

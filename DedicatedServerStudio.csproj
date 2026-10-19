@@ -7,7 +7,7 @@
     <AssemblyName>DedicatedServerStudio</AssemblyName>
     <RootNamespace>DedicatedServerStudio</RootNamespace>
     <Product>Dedicated Server Studio</Product>
-    <Version>0.4.8</Version>
+    <Version>0.4.9</Version>
     <DssUpdaterEnabled Condition="'$(DssUpdaterEnabled)' == ''">true</DssUpdaterEnabled>
     <DefineConstants Condition="'$(DssUpdaterEnabled)' != 'false'">$(DefineConstants);DSS_UPDATER_ENABLED</DefineConstants>
   </PropertyGroup>
@@ -24,8 +24,8 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(DssUpdaterEnabled)' == 'false'">
-    <!-- Nexus excludes the automatic update client; publish.ps1 separately includes the offline ZIP helper. -->
-    <Compile Remove="Services\GitHubReleaseService.cs;Services\DssUpdateProgressStore.cs" />
+    <!-- Nexus uses local packages from .dss-builds instead of querying GitHub releases. -->
+    <Compile Remove="Services\GitHubReleaseService.cs" />
     <None Remove="apply-update.ps1" />
   </ItemGroup>
 

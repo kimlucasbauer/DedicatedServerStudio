@@ -15,7 +15,9 @@ import { observeTranslations, translateText } from './i18n.js';
 
 const DssContext = createContext(null);
 const useDss = () => useContext(DssContext);
-const DSS_UPDATER_ENABLED = import.meta.env.VITE_DSS_UPDATER_ENABLED !== 'false';
+const DSS_UPDATE_MODE = import.meta.env.VITE_DSS_UPDATE_MODE === 'local' ? 'local' : 'github';
+const DSS_UPDATE_CHECK_ENDPOINT = import.meta.env.VITE_DSS_UPDATE_CHECK_ENDPOINT || '/api/app/update';
+const DSS_UPDATE_INSTALL_ENDPOINT = import.meta.env.VITE_DSS_UPDATE_INSTALL_ENDPOINT || '/api/app/update/install';
 async function copyTextToClipboard(text) {
   if (navigator.clipboard?.writeText && window.isSecureContext) {
     try {
@@ -77,9 +79,10 @@ function BrandWords() {
 }
 
 function BrandLockup({ sidebar = false, login = false, updateAvailable = false, updateKnown = false, checkingUpdate = false, appVersion = '', latestVersion = '', onOpenUpdate }) {
+  const updateSource = DSS_UPDATE_MODE === 'local' ? 'versões locais em .dss-builds' : 'releases do GitHub';
   return <div className={`brand-lockup ${sidebar ? 'sidebar-brand-lockup' : ''} ${login ? 'login-brand-lockup' : ''}`}>
     <Link to="/" className={`brand-home-link ${login ? 'login-brand-link' : ''}`} aria-label="Dedicated Server Studio"><img src={login ? '/brand/dss-monogram.svg' : '/brand/dss-terminal.svg'} alt=""/>{!login&&<BrandWords/>}</Link>
-    {sidebar && DSS_UPDATER_ENABLED && <button type="button" className={`brand-update-button ${updateAvailable ? 'available' : updateKnown ? 'current' : ''} ${checkingUpdate ? 'checking' : ''}`} onClick={onOpenUpdate} disabled={!updateKnown || checkingUpdate} aria-haspopup="dialog" aria-label={updateAvailable ? `Atualização do DSS disponível: versão ${latestVersion}` : checkingUpdate ? 'Verificando atualizações do DSS' : updateKnown ? `DSS atualizado · versão ${appVersion}` : 'Ver versão do DSS'} title={updateAvailable ? 'Ver detalhes da atualização do DSS' : checkingUpdate ? 'Verificando atualizações do DSS' : updateKnown ? 'Ver detalhes da versão do DSS' : 'Versão do DSS'}>
+    {sidebar && <button type="button" className={`brand-update-button ${updateAvailable ? 'available' : updateKnown ? 'current' : ''} ${checkingUpdate ? 'checking' : ''}`} onClick={onOpenUpdate} disabled={!updateKnown || checkingUpdate} aria-haspopup="dialog" aria-label={updateAvailable ? `Atualização do DSS disponível: versão ${latestVersion}` : checkingUpdate ? `Verificando ${updateSource}` : updateKnown ? `DSS · versão ${appVersion}` : `Verificar ${updateSource}`} title={updateAvailable ? `Nova versão ${latestVersion} · ${updateSource}` : checkingUpdate ? `Verificando ${updateSource}` : updateKnown ? `Verificar novamente · ${updateSource}` : `Verificar ${updateSource}`}>
       {checkingUpdate ? <LoaderCircle size={16} className="spin"/> : updateAvailable ? <Download size={16}/> : updateKnown ? <Check size={16}/> : <Download size={16}/>}<i aria-hidden="true"/>
     </button>}
   </div>;
@@ -241,7 +244,7 @@ function NotificationCenter() {
 }
 
 function AppShell() {
-  const { auth, setAuth, language, dashboard } = useDss(); const [mobileOpen, setMobileOpen] = useState(false); const [accountMenuOpen,setAccountMenuOpen]=useState(false); const [myProfileOpen,setMyProfileOpen]=useState(false); const [elevationOpen,setElevationOpen]=useState(false); const [elevationStatus,setElevationStatus]=useState(null); const [elevationBusy,setElevationBusy]=useState(false); const [elevationError,setElevationError]=useState(''); const [appVersion,setAppVersion]=useState('…'); const [appStartupId,setAppStartupId]=useState(''); const [appUpdate,setAppUpdate]=useState(null); const [appUpdateChecking,setAppUpdateChecking]=useState(false); const [appUpdateOpen,setAppUpdateOpen]=useState(false); const [appUpdateBusy,setAppUpdateBusy]=useState(false); const [appUpdateProgress,setAppUpdateProgress]=useState(null); const [appUpdateError,setAppUpdateError]=useState(''); const accountMenuRef=useRef(null); const elevationStartupIdRef=useRef(null); const updateResumeRef=useRef(false); const location = useLocation();
+  const { auth, setAuth, language, dashboard } = useDss(); const [mobileOpen, setMobileOpen] = useState(false); const [accountMenuOpen,setAccountMenuOpen]=useState(false); const [myProfileOpen,setMyProfileOpen]=useState(false); const [elevationOpen,setElevationOpen]=useState(false); const [elevationStatus,setElevationStatus]=useState(null); const [elevationBusy,setElevationBusy]=useState(false); const [elevationError,setElevationError]=useState(''); const [appVersion,setAppVersion]=useState('…'); const [appStartupId,setAppStartupId]=useState(''); const [appUpdate,setAppUpdate]=useState(null); const [selectedLocalPackage,setSelectedLocalPackage]=useState(''); const [appUpdateChecking,setAppUpdateChecking]=useState(false); const [appUpdateOpen,setAppUpdateOpen]=useState(false); const [appUpdateBusy,setAppUpdateBusy]=useState(false); const [appUpdateProgress,setAppUpdateProgress]=useState(null); const [appUpdateError,setAppUpdateError]=useState(''); const accountMenuRef=useRef(null); const elevationStartupIdRef=useRef(null); const updateResumeRef=useRef(false); const location = useLocation();
   useEffect(() => {
     let active = true;
     fetch('/api/health', { cache:'no-store' }).then(response => response.ok ? response.json() : null).then(status => {
@@ -250,15 +253,13 @@ function AppShell() {
     return () => { active = false; };
   }, []);
   useEffect(() => {
-    if (!DSS_UPDATER_ENABLED) { setAppUpdate(null); return; }
     if (!auth.authenticated || auth.user?.role !== 'admin') { setAppUpdate(null); return; }
     let active = true;
     setAppUpdateChecking(true);
-    api('/api/app/update', { suppressFailureToast:true }).then(result => { if (active) setAppUpdate(result); }).catch(() => {}).finally(() => { if (active) setAppUpdateChecking(false); });
+    api(DSS_UPDATE_CHECK_ENDPOINT, { suppressFailureToast:true }).then(result => { if (active) { setAppUpdate(result); setSelectedLocalPackage(result.packageName || ''); } }).catch(() => {}).finally(() => { if (active) setAppUpdateChecking(false); });
     return () => { active = false; };
   }, [auth.authenticated, auth.user?.role]);
   useEffect(() => {
-    if (!DSS_UPDATER_ENABLED) return;
     if (!auth.authenticated || auth.user?.role !== 'admin' || !appStartupId || updateResumeRef.current) return;
     let operationId = '';
     try { operationId = sessionStorage.getItem('dss-update-operation') || ''; } catch {}
@@ -349,7 +350,17 @@ function AppShell() {
   const remoteAccess = dashboard?.clientAccess?.isLocal === false;
   const remoteAccessLabel = dashboard?.clientAccess?.network === 'lan' ? 'Conectado pela rede local' : dashboard?.clientAccess?.network === 'public' ? 'Conectado pela internet' : 'Conectado pela rede';
   const hostAddress = window.location.hostname;
+  const selectedLocalPackageInfo = appUpdate?.availablePackages?.find(item => item.packageName === selectedLocalPackage) || null;
+  const updateTargetVersion = DSS_UPDATE_MODE === 'local' ? selectedLocalPackageInfo?.version || appUpdate?.latestVersion || '' : appUpdate?.latestVersion || '';
   async function logout() { setAccountMenuOpen(false); await api('/api/auth/logout', { method: 'POST', body: '{}' }).catch(() => {}); setAuth(current => ({ ...current, authenticated: false })); }
+  async function openDssUpdate() {
+    setAppUpdateError('');
+    setAppUpdateOpen(true);
+    setAppUpdateChecking(true);
+    try { const result = await api(DSS_UPDATE_CHECK_ENDPOINT, { suppressFailureToast:true }); setAppUpdate(result); setSelectedLocalPackage(result.packageName || ''); }
+    catch (error) { setAppUpdateError(error.message || 'Não foi possível verificar atualizações do DSS.'); }
+    finally { setAppUpdateChecking(false); }
+  }
   async function installDssUpdate() {
     if (!appUpdate?.updateAvailable || !appUpdate.packageAvailable) return;
     setAppUpdateBusy(true); setAppUpdateError('');
@@ -360,12 +371,12 @@ function AppShell() {
       message:'O DSS está reiniciando para aplicar a versão validada.'
     }) : current);
     try {
-      const accepted = await api('/api/app/update/install', { method:'POST', body:'{}' });
+      const accepted = await api(DSS_UPDATE_INSTALL_ENDPOINT, { method:'POST', body:JSON.stringify(DSS_UPDATE_MODE === 'local' ? { packageName:selectedLocalPackage } : {}) });
       const operationId = accepted.operationId;
       if (!operationId) throw new Error('O DSS não iniciou uma operação de atualização válida.');
       sessionStorage.setItem('dss-update-operation', operationId);
       sessionStorage.setItem('dss-update-startup', appStartupId || '');
-      sessionStorage.setItem('dss-update-target', appUpdate.latestVersion || '');
+      sessionStorage.setItem('dss-update-target', updateTargetVersion);
       setAppUpdateProgress(accepted);
       const deadline = Date.now() + 45 * 60 * 1000;
       while (Date.now() < deadline) {
@@ -384,7 +395,7 @@ function AppShell() {
           const response = await fetch('/api/health', { cache:'no-store' });
           if (!response.ok) continue;
           const health = await response.json();
-          if (health.version === appUpdate.latestVersion && (!appStartupId || health.startupId !== appStartupId)) { sessionStorage.removeItem('dss-update-operation'); sessionStorage.removeItem('dss-update-startup'); sessionStorage.removeItem('dss-update-target'); window.location.reload(); return; }
+          if (health.version === updateTargetVersion && (!appStartupId || health.startupId !== appStartupId)) { sessionStorage.removeItem('dss-update-operation'); sessionStorage.removeItem('dss-update-startup'); sessionStorage.removeItem('dss-update-target'); window.location.reload(); return; }
         } catch { /* The app is restarting. */ }
       }
       sessionStorage.removeItem('dss-update-operation');
@@ -428,7 +439,7 @@ function AppShell() {
   const navItems = [[Home, 'Home', '/'], [LayoutDashboard, 'Dashboard', '/dashboard'], ...(auth.user?.role === 'admin' ? [[Users, 'Usuários e acessos', '/usuarios']] : []), [Settings, 'Configurações', '/configuracoes'], [History, 'Histórico', '/historico']];
   return <div className="app-shell flex min-h-screen bg-dss-950 text-dss-text">
     <aside className={`sidebar ${mobileOpen ? 'mobile-open' : ''}`}>
-      <BrandLockup sidebar updateAvailable={Boolean(appUpdate?.updateAvailable)} updateKnown={Boolean(appUpdate)} checkingUpdate={appUpdateChecking} appVersion={appVersion} latestVersion={appUpdate?.latestVersion || ''} onOpenUpdate={() => { if (!appUpdate) return; setAppUpdateError(''); setAppUpdateOpen(true); }}/>
+      <BrandLockup sidebar updateAvailable={Boolean(appUpdate?.updateAvailable)} updateKnown={Boolean(appUpdate)} checkingUpdate={appUpdateChecking} appVersion={appVersion} latestVersion={appUpdate?.latestVersion || ''} onOpenUpdate={openDssUpdate}/>
       <div className={'host-card ' + (remoteAccess ? 'remote' : 'local')} title={remoteAccess ? remoteAccessLabel + ' · ' + hostAddress : 'O navegador e o painel estão no mesmo computador'}><span className="host-icon">{remoteAccess ? <Network size={18}/> : <Home size={18}/>}</span><div className="host-copy"><div className="host-copy-head"><span className="host-kicker">{remoteAccess ? 'CONEXÃO AO PAINEL' : 'HOST DO PAINEL'}</span><span className="host-access-badge">{remoteAccess ? 'REMOTO' : 'LOCAL'}</span></div><b>{remoteAccess ? 'Servidor remoto' : 'Este computador'}</b><small><i className="status-dot"/>{remoteAccess ? remoteAccessLabel : 'Gerenciado localmente'}</small>{remoteAccess&&<code className="host-address">{hostAddress}</code>}</div></div>
       <span className="nav-label">PAINEL</span><nav className="side-nav">{navItems.map(([Icon, label, to]) => <NavLink key={to} to={to} end={to === '/'} className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`} onClick={() => setMobileOpen(false)}><Icon size={18}/>{label}</NavLink>)}</nav>
       <span className="nav-label ecosystem-label">ECOSSISTEMA</span><nav className="side-nav"><NavLink to="/integracoes" className={({ isActive }) => `nav-item ${isActive ? 'active' : ''}`} onClick={() => setMobileOpen(false)}><Activity size={18}/>Integrações</NavLink></nav>
@@ -443,14 +454,19 @@ function AppShell() {
       </div></Modal>}{myProfileOpen&&<MyProfileModal user={auth.user} close={()=>setMyProfileOpen(false)} onUserUpdated={updates=>setAuth(current=>({...current,user:{...current.user,...updates}}))}/>}<div className="content" data-read-only={auth.user?.role === 'user' ? 'true' : undefined}><Routes>
       <Route path="/" element={<HomePage/>}/><Route path="/dashboard" element={<DashboardPage/>}/><Route path="/games/:gameId/servers" element={<ProfilesPage/>}/><Route path="/games/:gameId/servers/:profileId/*" element={<ProfileRoute/>}/><Route path="/usuarios" element={auth.user?.role==='admin'?<AdminUsersPage/>:<HomePage/>}/><Route path="/historico" element={<GlobalHistoryPage/>}/><Route path="/configuracoes" element={<SettingsPage preferences={auth.user?.role === 'user'}/>}/><Route path="/configuracoes/preferencias" element={<SettingsPage preferences/>}/><Route path="/integracoes" element={<IntegrationsPage/>}/><Route path="*" element={<HomePage/>}/>
       </Routes></div><footer className="app-footer"><span>DEDICATED SERVER STUDIO <em>DSS · {appVersion}</em></span><span><i className="status-dot"/> Dados neste computador</span></footer></div>
-    {DSS_UPDATER_ENABLED&&appUpdateOpen&&appUpdate&&<Modal className="dss-update-modal" title="Atualização do DSS" description={appUpdate.updateAvailable?`Uma nova versão está disponível: ${appUpdate.latestVersion}.`:'O DSS está atualizado.'} close={()=>{if(!appUpdateBusy)setAppUpdateOpen(false);}}>
-      <section className="dss-update-version-card"><span className="dss-update-icon"><Download size={20}/></span><div><small>VERSÃO MAIS RECENTE</small><b>{appUpdate.latestVersion||appVersion}</b><span>Instalada: {appVersion}{appUpdate.publishedAt?` · publicada em ${fmtDate(appUpdate.publishedAt)}`:''}</span></div><span className={`state-badge ${appUpdate.updateAvailable?'running':'stopped'}`}>{appUpdate.updateAvailable?'ATUALIZAÇÃO':'ATUALIZADO'}</span></section>
+    {appUpdateOpen&&appUpdate&&<Modal className="dss-update-modal" title={DSS_UPDATE_MODE === 'local' ? 'Atualizações locais do DSS' : 'Atualização do DSS'} description={appUpdate.updateAvailable?`Uma nova versão está disponível: ${updateTargetVersion}.`:DSS_UPDATE_MODE === 'local'?'Nenhuma versão mais recente foi encontrada na pasta local.':'O DSS está atualizado.'} close={()=>{if(!appUpdateBusy)setAppUpdateOpen(false);}}>
+      <section className="dss-update-version-card"><span className="dss-update-icon"><Download size={20}/></span><div><small>{DSS_UPDATE_MODE === 'local'?'PACOTE LOCAL SELECIONADO':'VERSÃO MAIS RECENTE'}</small><b>{DSS_UPDATE_MODE === 'local' ? updateTargetVersion || appVersion : appUpdate.latestVersion||appVersion}</b><span>Instalada: {appVersion}{DSS_UPDATE_MODE === 'local'&&selectedLocalPackageInfo?.lastModified?` · arquivo atualizado em ${fmtDate(selectedLocalPackageInfo.lastModified)}`:DSS_UPDATE_MODE !== 'local'&&appUpdate.publishedAt?` · publicada em ${fmtDate(appUpdate.publishedAt)}`:''}</span></div><span className={`state-badge ${appUpdate.updateAvailable?'running':'stopped'}`}>{appUpdate.updateAvailable?'ATUALIZAÇÃO':DSS_UPDATE_MODE === 'local'?'SEM NOVA VERSÃO':'ATUALIZADO'}</span></section>
+      {DSS_UPDATE_MODE === 'local'&&<div className="notice dss-update-notice"><ShieldCheck size={16}/><span><b>Verificação local, sem integração com o Git.</b> O DSS procura versões mais recentes em <code>.dss-builds</code> ao lado de <code>DSS.cmd</code>. Coloque nessa pasta um ZIP oficial chamado <code>DedicatedServerStudio-&lt;versão&gt;-production.zip</code> ou <code>DedicatedServerStudio-&lt;versão&gt;-nexus.zip</code>; este pacote não consulta o GitHub.</span></div>}
+      {DSS_UPDATE_MODE === 'local'&&(appUpdate.availablePackages?.length||0)>0&&<label className="field-label">Versão local para instalar<select className="field" value={selectedLocalPackage} onChange={event=>setSelectedLocalPackage(event.target.value)} disabled={appUpdateBusy}>{appUpdate.availablePackages.map(item=><option key={item.packageName} value={item.packageName}>{item.packageName} · {item.version}</option>)}</select></label>}
+      {DSS_UPDATE_MODE === 'local'&&selectedLocalPackageInfo&&<div className="notice dss-update-notice"><Download size={16}/><span>Pacote selecionado: <code>{selectedLocalPackageInfo.packageName}</code> · {bytes(selectedLocalPackageInfo.packageSize)}</span></div>}
+      {DSS_UPDATE_MODE === 'local'&&(appUpdate.availablePackages?.length||0)>0&&<div className="notice dss-update-notice"><Package size={16}/><span>ZIPs encontrados: {appUpdate.availablePackages.map(item=>item.packageName).join(' · ')}</span></div>}
+      {DSS_UPDATE_MODE === 'local'&&!appUpdate.updateAvailable&&<div className="notice dss-update-notice"><CircleAlert size={16}/><span>Nenhuma versão local mais recente foi encontrada. Verifique se o ZIP está em <code>.dss-builds</code> e se o nome contém uma versão superior a {appVersion}.</span></div>}
       {appUpdate.updateAvailable&&appUpdate.releaseNotes&&<section className="dss-update-notes"><h3>{appUpdate.releaseName}</h3><ReleaseNotesMarkdown source={appUpdate.releaseNotes}/></section>}
       {appUpdate.updateAvailable&&!appUpdate.packageAvailable&&<div className="notice dss-update-notice"><CircleAlert size={16}/><span>A release ainda não tem o arquivo <code>DedicatedServerStudio-{appUpdate.latestVersion}-production.zip</code>.</span><a href={appUpdate.releasePageUrl} target="_blank" rel="noreferrer"><ExternalLink size={14}/> Abrir release</a></div>}
       {appUpdate.updateAvailable&&<div className="notice dss-update-notice"><ShieldCheck size={16}/><span>A atualização reinicia apenas o painel. Servidores com console persistente conectado continuam em execução e voltam a aparecer no console e na Gestão quando o painel retornar. Aguarde qualquer operação do SteamCMD terminar.</span></div>}
       {appUpdateError&&<div className="inline-error"><CircleAlert size={16}/>{appUpdateError}</div>}
-      {appUpdateBusy&&<DssUpdateProgress progress={appUpdateProgress} version={appUpdate.latestVersion}/>}
-      <div className="modal-actions"><Button disabled={appUpdateBusy} onClick={()=>setAppUpdateOpen(false)}>Agora não</Button>{appUpdate.updateAvailable&&appUpdate.packageAvailable&&<Button variant="primary" disabled={appUpdateBusy} onClick={installDssUpdate}><Download size={15}/>{appUpdateBusy?'Atualizando…':'Atualizar e reiniciar'}</Button>}</div>
+      {appUpdateBusy&&<DssUpdateProgress progress={appUpdateProgress} version={updateTargetVersion}/>}
+      <div className="modal-actions"><Button disabled={appUpdateBusy} onClick={()=>setAppUpdateOpen(false)}>Agora não</Button>{appUpdate.updateAvailable&&appUpdate.packageAvailable&&(DSS_UPDATE_MODE !== 'local'||selectedLocalPackageInfo)&&<Button variant="primary" disabled={appUpdateBusy} onClick={installDssUpdate}><Download size={15}/>{appUpdateBusy?'Atualizando…':'Atualizar e reiniciar'}</Button>}</div>
     </Modal>}
   </div>;
 }
@@ -1790,19 +1806,36 @@ function getPackageDependencyMinimum(dependency, packageId) {
 
 function configFilesForMod(mod, allFiles) {
   const configPrefix = 'bepinex/config/';
-  const owned = new Set((mod.managedFiles || []).map(path => {
-    const normalized = String(path).replaceAll('\\', '/');
-    const index = normalized.toLocaleLowerCase().indexOf(configPrefix);
-    return index >= 0 ? normalized.slice(index + configPrefix.length).toLocaleLowerCase() : null;
+  const managedFiles=(mod.managedFiles||[]).map(path=>String(path).replaceAll('\\','/'));
+  const owned = new Set(managedFiles.map(path => {
+    const normalized = path.toLocaleLowerCase();
+    const index = normalized.indexOf(configPrefix);
+    return index >= 0 ? normalized.slice(index + configPrefix.length) : null;
   }).filter(Boolean));
   const normalize = value => String(value || '').toLocaleLowerCase().replace(/[^a-z0-9]/g, '');
-  const packageName = String(mod.packageId || '').split('-').slice(1).join('-');
-  const tokens = [...new Set([normalize(mod.name), normalize(packageName)].filter(token => token.length >= 5))];
+  const ignoredTokens=new Set(['bepinex','config','configuration','default','dll','mod','mods','plugin','plugins','server','temp','temporary','valheim']);
+  const tokens=new Set();
+  const addTokens=value=>{
+    const text=String(value||'');
+    const whole=normalize(text);
+    if(whole.length>=5&&!ignoredTokens.has(whole))tokens.add(whole);
+    for(const part of text.split(/[^a-z0-9]+/i)){
+      const token=normalize(part);
+      if(token.length>=5&&!ignoredTokens.has(token))tokens.add(token);
+    }
+  };
+  addTokens(mod.name);
+  addTokens(String(mod.packageId||'').split('-').slice(1).join('-'));
+  for(const path of managedFiles){
+    if(!/\.dll$/i.test(path)||!path.toLocaleLowerCase().includes('bepinex/plugins/'))continue;
+    addTokens(path.split('/').at(-1).replace(/\.[^.]+$/,''));
+  }
+  const searchTokens=[...tokens];
   const related = allFiles.filter(path => {
     const normalizedPath = String(path).replaceAll('\\', '/').toLocaleLowerCase();
     if (owned.has(normalizedPath)) return true;
     const normalizedName = normalize(normalizedPath.split('/').at(-1)?.replace(/\.[^.]+$/, ''));
-    return tokens.some(token => normalizedName.includes(token) || token.includes(normalizedName));
+    return searchTokens.some(token => normalizedName.includes(token));
   });
   return related.length ? { files: related, matched: true } : { files: allFiles, matched: false };
 }
@@ -1895,7 +1928,7 @@ function InstalledModSettingsModal({ profile, mod, packages, close, onApplied, n
   return <Modal title={`Gerenciar ${mod.name}`} description={`Versão atual ${mod.version} · origem ${providerNames[currentProvider]||currentProvider}`} close={close} className="mod-settings-modal">
     <section className="mod-version-section"><div className="modal-section-title"><div><h3>Versão do mod</h3><p>Versões abaixo do mínimo exigido pelas dependências ficam bloqueadas.</p></div><span className="state-badge">ATUAL {mod.version}</span></div>
       {mod.locked&&<div className="notice version-locked-notice"><Lock size={15}/> Versão bloqueada em {mod.version}. Desbloqueie este mod no card para instalar versões manualmente ou atender a dependências.</div>}{loading?<Spinner label="Buscando pacote nos provedores e carregando configurações…"/>:<><label className="field-label">Provedor para instalar<select className="field" value={provider} disabled={mod.locked||profile.runtimeStatus==='running'||busy||providerOptions.length<1} onChange={event=>chooseProvider(event.target.value)}>{providerOptions.map(item=><option key={item.id} value={item.id} disabled={!item.available}>{item.name}{item.available?' · pacote encontrado':` · ${item.error||'indisponível'}`}</option>)}</select></label>
-      <label className="field-label">Versão para instalar<select className="field" value={version} disabled={mod.locked||profile.runtimeStatus==='running'||busy||!allowedVersions.length} onChange={event=>setVersion(event.target.value)}>{allowedVersions.map(item=><option key={item.version} value={item.version}>{item.version}{String(item.version).toLowerCase()===String(mod.version).toLowerCase()&&provider===currentProvider?' · instalada':''}{minRequired&&comparePackageVersions(item.version,minRequired)===0?' · mínimo permitido':''}</option>)}</select></label>
+      <label className="field-label">Versão para instalar<select className="field" value={version} disabled={mod.locked||busy||!allowedVersions.length} onChange={event=>setVersion(event.target.value)}>{allowedVersions.map(item=><option key={item.version} value={item.version}>{item.version}{String(item.version).toLowerCase()===String(mod.version).toLowerCase()&&provider===currentProvider?' · instalada':''}{minRequired&&comparePackageVersions(item.version,minRequired)===0?' · mínimo permitido':''}</option>)}</select></label>
       <div className="version-minimum-note"><b>Versão mais antiga aceita: {minRequired||allowedVersions.at(-1)?.version||mod.version}</b>{requirements.length?<ul>{requirements.map((item,index)=><li key={`${item.name}-${item.version}-${index}`}>{item.name} exige no mínimo {item.version}</li>)}</ul>:<small>Nenhum mod instalado declara uma versão mínima para este pacote.</small>}</div>
       {error&&<div className="inline-error" role="alert">{error}</div>}
       <div className="modal-actions"><Button onClick={close}>Fechar</Button><Button variant="primary" disabled={mod.locked||busy||profile.runtimeStatus==='running'||!version||(provider===currentProvider&&version.toLowerCase()===String(mod.version).toLowerCase())||!!(minRequired&&comparePackageVersions(version,minRequired)<0)} onClick={applyVersion}>{busy?'Instalando…':provider!==currentProvider?'Trocar provedor e instalar': 'Aplicar versão'}</Button></div></>}

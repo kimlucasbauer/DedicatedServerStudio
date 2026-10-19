@@ -21,7 +21,9 @@ $versionNode = Select-Xml -LiteralPath $projectFile -XPath '/Project/PropertyGro
 $version = [string]$versionNode.Node.InnerText
 if ([string]::IsNullOrWhiteSpace($version)) { throw 'Could not read the DSS version from the project file.' }
 $flavors = if ($PackageFlavor -eq 'Both') { @('GitHub', 'Nexus') } else { @($PackageFlavor) }
-$originalUpdaterFlag = $env:VITE_DSS_UPDATER_ENABLED
+$originalUpdateMode = $env:VITE_DSS_UPDATE_MODE
+$originalUpdateCheckEndpoint = $env:VITE_DSS_UPDATE_CHECK_ENDPOINT
+$originalUpdateInstallEndpoint = $env:VITE_DSS_UPDATE_INSTALL_ENDPOINT
 
 Push-Location $projectRoot
 try {
@@ -33,7 +35,9 @@ try {
     foreach ($flavor in $flavors) {
         $updaterEnabled = $flavor -eq 'GitHub'
         $updaterValue = $updaterEnabled.ToString().ToLowerInvariant()
-        $env:VITE_DSS_UPDATER_ENABLED = $updaterValue
+        $env:VITE_DSS_UPDATE_MODE = if ($updaterEnabled) { 'github' } else { 'local' }
+        $env:VITE_DSS_UPDATE_CHECK_ENDPOINT = if ($updaterEnabled) { '/api/app/update' } else { '/api/app/update/local' }
+        $env:VITE_DSS_UPDATE_INSTALL_ENDPOINT = if ($updaterEnabled) { '/api/app/update/install' } else { '/api/app/update/local/install' }
         $outputName = if ($flavor -eq 'GitHub') { 'web' } else { 'nexus' }
         $archiveSuffix = if ($flavor -eq 'GitHub') { 'production' } else { 'nexus' }
         $webOutput = [IO.Path]::GetFullPath((Join-Path $publishRoot $outputName))
@@ -84,7 +88,9 @@ try {
 
     if ($PackageFlavor -eq 'Both') {
         # Leave the developer checkout in its normal GitHub-enabled build state.
-        $env:VITE_DSS_UPDATER_ENABLED = 'true'
+        $env:VITE_DSS_UPDATE_MODE = 'github'
+        $env:VITE_DSS_UPDATE_CHECK_ENDPOINT = '/api/app/update'
+        $env:VITE_DSS_UPDATE_INSTALL_ENDPOINT = '/api/app/update/install'
         Push-Location (Join-Path $projectRoot 'frontend')
         try {
             & npm run build
@@ -109,7 +115,11 @@ try {
     }
 }
 finally {
-    if ($null -eq $originalUpdaterFlag) { Remove-Item Env:VITE_DSS_UPDATER_ENABLED -ErrorAction SilentlyContinue }
-    else { $env:VITE_DSS_UPDATER_ENABLED = $originalUpdaterFlag }
+    if ($null -eq $originalUpdateMode) { Remove-Item Env:VITE_DSS_UPDATE_MODE -ErrorAction SilentlyContinue }
+    else { $env:VITE_DSS_UPDATE_MODE = $originalUpdateMode }
+    if ($null -eq $originalUpdateCheckEndpoint) { Remove-Item Env:VITE_DSS_UPDATE_CHECK_ENDPOINT -ErrorAction SilentlyContinue }
+    else { $env:VITE_DSS_UPDATE_CHECK_ENDPOINT = $originalUpdateCheckEndpoint }
+    if ($null -eq $originalUpdateInstallEndpoint) { Remove-Item Env:VITE_DSS_UPDATE_INSTALL_ENDPOINT -ErrorAction SilentlyContinue }
+    else { $env:VITE_DSS_UPDATE_INSTALL_ENDPOINT = $originalUpdateInstallEndpoint }
     Pop-Location
 }
